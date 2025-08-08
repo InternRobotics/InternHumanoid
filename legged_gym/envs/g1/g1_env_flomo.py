@@ -29,93 +29,81 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, envs
-from isaacgym import gymtorch, gymapi, gymutil
-
+from time import time
+from warnings import WarningMessage
+import numpy as np
 import os
 import copy
-import time
-import threading
-import numpy as np
-import torch
-import lcm
 
-
-from lcm_types.xsense_lcmt import xsense_lcmt
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
+
+import torch
+from torch import Tensor
+from typing import Tuple, Dict
+
+from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.terrain import Terrain
 from legged_gym.envs.base.base_task import BaseTask
-from legged_gym.utils.math import euler_from_quaternion
-from easydict import EasyDict
+from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float, get_yaw_quat_from_quat
+from legged_gym.utils.helpers import class_to_dict
+import threading
+import time
+from numbers import Number
+
+import matplotlib.pyplot as plt
+import pickle as pkl
 
 
-class OnlineAcc(torch.nn.Module):
-    def __init__(self, dt: float, tau: float):
-        super().__init__()
-        alpha = float(np.exp(-dt / tau))
-        self.register_buffer("alpha", torch.tensor(alpha))
-        self.dt = dt
-        self.v_filt_prev = None
+def euler_from_quaternion(quat_angle):
+    """
+    Convert a quaternion into euler angles (roll, pitch, yaw)
+    roll is rotation around x in radians (counterclockwise)
+    pitch is rotation around y in radians (counterclockwise)
+    yaw is rotation around z in radians (counterclockwise)
+    """
+    x = quat_angle[:, 0]
+    y = quat_angle[:, 1]
+    z = quat_angle[:, 2]
+    w = quat_angle[:, 3]
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = torch.atan2(t0, t1)
 
-    def forward(self, v_now: torch.Tensor):
-        if self.v_filt_prev is None:
-            self.v_filt_prev = v_now.clone()
-            return torch.zeros_like(v_now)
-        v_filt = (1.0 - self.alpha) * v_now + self.alpha * self.v_filt_prev
-        a_now = (v_filt - self.v_filt_prev) / self.dt
-        self.v_filt_prev = v_filt
-        return a_now
+    t2 = +2.0 * (w * y - z * x)
+    t2 = torch.clip(t2, -1, 1)
+    pitch_y = torch.asin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = torch.atan2(t3, t4)
+
+    return roll_x.unsqueeze(1), pitch_y.unsqueeze(1), yaw_z.unsqueeze(1)
 
 
 class Flomo(BaseTask):
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
-        """Parses the provided config file, creates simulation, terrain and environments, and initializes pytorch buffers used during training.
+        """Parses the provided config file,
+            calls create_sim() (which creates, simulation, terrain and environments),
+            initilizes pytorch buffers used during training
 
         Args:
             cfg (Dict): Environment config file
             sim_params (gymapi.SimParams): simulation parameters
             physics_engine (gymapi.SimType): gymapi.SIM_PHYSX (must be PhysX)
-            sim_device (string): 'cuda' or 'cpu'
+            device_type (string): 'cuda' or 'cpu'
+            device_id (int): 0, 1, ...
             headless (bool): Run without rendering if True
         """
         self.cfg = cfg
         self.sim_params = sim_params
-        self.physics_engine = physics_engine
-        self.sim_device = sim_device
-        sim_device_type, self.sim_device_id = gymutil.parse_device_str(self.sim_device)
-        self.headless = headless
         self.height_samples = None
         self.debug_viz = True
         self.init_done = False
         self._parse_cfg(self.cfg)
-        self.gym = gymapi.acquire_gym()
-
-        # env device is GPU only if sim is on GPU and use_gpu_pipeline = True, 
-        # otherwise returned tensors are copied to CPU by physX.
-        if sim_device_type == "cuda" and sim_params.use_gpu_pipeline:
-            self.device = self.sim_device
-        else:
-            self.device = "cpu"
-
-        # graphics device for rendering, -1 for no rendering
-        self.graphics_device_id = self.sim_device_id
-        if self.headless:
-            self.graphics_device_id = -1
-
-        self.num_envs = cfg.env.num_envs
-        # optimization flags for pytorch JIT
-        torch._C._jit_set_profiling_mode(False)
-        torch._C._jit_set_profiling_executor(False)
-
-        self.extras = {}
-        # create envs, sim and viewer
-        self.create_sim()
-        self.gym.prepare_sim(self.sim)
-        self.enable_viewer_sync = True
-        self.viewer = None
-
         self.fix_waist = self.cfg.control.fix_waist
-        self.freq_control = self.cfg.commands.freq_control
+        super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
+        self.num_actions = cfg.env.num_dofs
         self.num_one_step_obs = self.cfg.env.num_one_step_observations
         self.num_one_step_privileged_obs = self.cfg.env.num_one_step_privileged_obs
         self.actor_history_length = self.cfg.env.num_actor_history
@@ -149,36 +137,19 @@ class Flomo(BaseTask):
             assert (
                 self.cfg.env.num_actions == 14 and self.cfg.env.num_dofs == 29
             ), "Fixing waist is only supported for 14 (lower body actions + 2 dof waist actions) and 29 total dofs"
-
-        # if running with a viewer, set up camera
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
-
         self._init_buffers()
         self._prepare_reward_function()
         self.init_done = True
 
-        # LCM/teleop setup if needed
-        if self.cfg.env.upper_teleop:
-            self.lc = lcm.LCM("udpm://239.255.76.67:7667?ttl=255")
-            self.lc.subscribe("upper_action", self._upper_action_cb)
-            self.upper_action = torch.zeros(15).to(self.device)
-            thread = threading.Thread(target=self.lcm_poll, args=(240,))
-            thread.start()
-
-        # OnlineAcc attributes
-        self.left_acc_lin_vel = OnlineAcc(self.dt, self.dt * 2).to(self.device)
-        self.left_acc_ang_vel = OnlineAcc(self.dt, self.dt * 2).to(self.device)
-        self.right_acc_lin_vel = OnlineAcc(self.dt, self.dt * 2).to(self.device)
-        self.right_acc_ang_vel = OnlineAcc(self.dt, self.dt * 2).to(self.device)
-
-    def _upper_action_cb(self, channel, data):
-        msg = xsense_lcmt.decode(data)
-        self.upper_action[1:] = torch.tensor(msg.action).to(self.device)
-
-    def lcm_poll(self, freq):
-        while True:
-            self.lc.handle()
+    def reset(self):
+        """Reset all robots"""
+        self.reset_idx(torch.arange(self.num_envs, device=self.device))
+        obs, privileged_obs, _, _, _, _, _ = self.step(
+            torch.zeros(self.num_envs, self.num_lower_dof, device=self.device, requires_grad=False)
+        )
+        return obs, privileged_obs
 
     def step(self, actions):
         """Apply actions, simulate, call self.post_physics_step()
@@ -186,8 +157,13 @@ class Flomo(BaseTask):
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
+
+        # !!! WARNING: in fix waist == False case, # actions = 14
+        # !!! WARNING: [..., 12: waist yaw, 13: waist roll, 14: waist pitch, ...], where yaw is controlled by the user input, and roll & pitch are controlled by the policy. MUST be very careful with the order of actions!!!
         clip_actions = self.cfg.normalization.clip_actions
+
         if self.common_step_counter % self.cfg.domain_rand.upper_interval == 0:
+            # (NOTE) implementation of upper-body curriculum
             self.random_upper_ratio = min(self.action_curriculum_ratio, 1.0)
             uu = torch.rand(self.num_envs, self.num_actions - self.num_lower_dof, device=self.device)
             self.random_upper_ratio = (
@@ -199,9 +175,9 @@ class Flomo(BaseTask):
                 self.num_envs, self.num_actions - self.num_lower_dof
             ).to(self.device)
             if self.cfg.commands.heading_command:
-                command_ratio = self.command_ratio[:, [0]].max(dim=-1).values
+                command_ratio = self.command_ratio[:, [0]].max(dim=-1).values  # consider only x vel
             else:
-                command_ratio = self.command_ratio[:, [0]].max(dim=-1).values
+                command_ratio = self.command_ratio[:, [0]].max(dim=-1).values  # consider only x vel
             self.random_joint_ratio = self.random_joint_ratio * (1.0 - command_ratio.unsqueeze(1)) * 1.0
             rand_pos = torch.rand(self.num_envs, self.num_actions - self.num_lower_dof, device=self.device) - 0.5
 
@@ -213,7 +189,7 @@ class Flomo(BaseTask):
             self.delta_upper_actions = (self.random_upper_actions - self.current_upper_actions) / (
                 self.cfg.domain_rand.upper_interval
             )
-        self.current_upper_actions += self.delta_upper_actions  # * 0.0 # mask upper actions
+        self.current_upper_actions += self.delta_upper_actions
 
         concat_actions = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
         concat_actions[:, self.lower_dof_indices] = actions
@@ -230,6 +206,7 @@ class Flomo(BaseTask):
             for i in range(self.cfg.control.decimation):
                 self.delayed_actions[i] = self.last_actions + (self.actions - self.last_actions) * (i >= delay_steps)
 
+        # Randomize Joint Injections
         if self.cfg.domain_rand.randomize_joint_injection:
             self.joint_injection = torch_rand_float(
                 self.cfg.domain_rand.joint_injection_range[0],
@@ -237,9 +214,12 @@ class Flomo(BaseTask):
                 (self.num_envs, self.num_dof),
                 device=self.device,
             ) * self.torque_limits.unsqueeze(0)
+        # step physics and render each frame
         self.render()
         for _ in range(self.cfg.control.decimation):
+
             self.torques = self._compute_torques(self.actions).view(self.torques.shape)
+            # upper-body with position control; lower-body with force control;
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
             self.gym.simulate(self.sim)
@@ -247,6 +227,8 @@ class Flomo(BaseTask):
             self.gym.refresh_dof_state_tensor(self.sim)
 
         termination_ids, termination_priveleged_obs = self.post_physics_step()
+
+        # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
@@ -271,6 +253,7 @@ class Flomo(BaseTask):
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
+        # prepare quantities
         self.base_quat[:] = self.root_states[:, 3:7]
         self.torso_quat = self.rigid_body_states[:, self.torso_body_index, 3:7]
         relative_quat = quat_mul(
@@ -289,6 +272,7 @@ class Flomo(BaseTask):
         self.feet_quat[:] = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices, 3:7]
         self.feet_vel[:] = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices, 7:10]
 
+        # compute contact related quantities
         contact = torch.norm(self.contact_forces[:, self.feet_indices], dim=-1) > 1.0
         self.contact_filt = torch.logical_or(contact, self.last_contacts)
         self.last_contacts = contact
@@ -298,11 +282,13 @@ class Flomo(BaseTask):
 
         self.feet_max_height = torch.maximum(self.feet_max_height, feet_height)
 
+        # compute joint power
         joint_power = torch.abs(self.torques * self.dof_vel).unsqueeze(1)
         self.joint_powers = torch.cat((self.joint_powers[:, 1:], joint_power), dim=1)
 
         self._post_physics_step_callback()
 
+        # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
@@ -315,6 +301,7 @@ class Flomo(BaseTask):
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_root_vel[:] = self.root_states[:, 7:13]
 
+        # reset contact related quantities
         self.feet_air_time *= ~self.contact_filt
         self.feet_max_height *= ~self.contact_filt
 
@@ -334,6 +321,7 @@ class Flomo(BaseTask):
         )
 
         _, _, feet_height_raw = self._get_feet_heights()
+
         self.reset_buf |= self.time_out_buf
         self.reset_buf |= self.gravity_termination_buf
         self.reset_buf |= torch.any(feet_height_raw < -0.15, dim=1)
@@ -352,18 +340,23 @@ class Flomo(BaseTask):
             return
         if self.cfg.terrain.curriculum:
             self._update_terrain_curriculum(env_ids)
+        # avoid updating command curriculum at each step since the maximum command is common to all envs
         if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length == 0):
             self.update_command_curriculum(env_ids)
+        # update action curriculum for specific dofs
         if self.cfg.env.action_curriculum and (self.common_step_counter % self.max_episode_length == 0):
             self.update_action_curriculum(env_ids)
 
         self.refresh_actor_rigid_shape_props(env_ids)
 
+        # reset robot states
         self._reset_root_states(env_ids)
         self._reset_dofs(env_ids)
 
+        # resample commands
         self._resample_commands(env_ids)
 
+        # reset buffers
         self.last_actions[env_ids] = 0.0
         self.last_last_actions[env_ids] = 0.0
         self.last_dof_vel[env_ids] = 0.0
@@ -383,6 +376,7 @@ class Flomo(BaseTask):
             self.cfg.rewards.base_height_target - 1.0
         ) * self.obs_scales.height_measurements
 
+        # reset randomized prop
         if self.cfg.domain_rand.randomize_kp:
             self.Kp_factors[env_ids] = torch_rand_float(
                 self.cfg.domain_rand.kp_range[0],
@@ -413,6 +407,7 @@ class Flomo(BaseTask):
                 device=self.device,
             )
 
+        # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = torch.mean(
@@ -425,11 +420,11 @@ class Flomo(BaseTask):
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
         if self.cfg.env.action_curriculum:
             self.extras["episode"]["action_curriculum_ratio"] = self.action_curriculum_ratio
+        # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
 
         self.episode_length_buf[env_ids] = 0
-        self.gait_indices[env_ids] = 0
 
     def compute_reward(self):
         """Compute rewards
@@ -442,11 +437,13 @@ class Flomo(BaseTask):
             rew = self.reward_functions[i]() * self.reward_scales[name]
             if torch.isnan(rew).any():
                 import ipdb
+
                 ipdb.set_trace()
             self.rew_buf += rew
             self.episode_sums[name] += rew
         if self.cfg.rewards.only_positive_rewards:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.0)
+        # add termination reward after clipping
         if "termination" in self.reward_scales:
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
@@ -454,53 +451,26 @@ class Flomo(BaseTask):
 
     def compute_observations(self):
         """Computes observations"""
-        is_standing = torch.norm(self.commands[:, :3], dim=1) < 0.1
-        processed_clock_inputs = torch.where(
-            is_standing.unsqueeze(1).repeat(1, 2), torch.ones_like(self.clock_inputs), self.clock_inputs
-        )
         imu_ang_vel = quat_rotate_inverse(
             self.rigid_body_states[:, self.imu_index, 3:7], self.rigid_body_states[:, self.imu_index, 10:13]
         )
         imu_projected_gravity = quat_rotate_inverse(self.rigid_body_states[:, self.imu_index, 3:7], self.gravity_vec)
-        torso_imu_ang_vel = quat_rotate_inverse(
-            self.rigid_body_states[:, self.torso_imu_index, 3:7], self.rigid_body_states[:, self.torso_imu_index, 10:13]
+        current_obs = torch.cat(
+            (
+                self.commands[:, :3] * self.commands_scale,
+                self.commands[:, 4].unsqueeze(1),
+                imu_ang_vel * self.obs_scales.ang_vel,
+                imu_projected_gravity,
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+                self.dof_vel * self.obs_scales.dof_vel,
+                self.actions[:, self.lower_dof_indices],
+            ),
+            dim=-1,
         )
-        torso_imu_projected_vel = quat_rotate_inverse(
-            self.rigid_body_states[:, self.torso_imu_index, 3:7], self.gravity_vec
-        )
-        if self.freq_control:
-            current_obs = torch.cat(
-                (
-                    self.commands[:, :3] * self.commands_scale,
-                    self.commands[:, 4:6],
-                    imu_ang_vel * self.obs_scales.ang_vel,
-                    imu_projected_gravity,
-                    torso_imu_ang_vel * self.obs_scales.ang_vel,
-                    torso_imu_projected_vel,
-                    (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                    self.dof_vel * self.obs_scales.dof_vel,
-                    self.actions[:, self.lower_dof_indices],
-                    processed_clock_inputs,
-                ),
-                dim=-1,
-            )
-        else:
-            current_obs = torch.cat(
-                (
-                    self.commands[:, :3] * self.commands_scale,
-                    self.commands[:, 4].unsqueeze(1),
-                    imu_ang_vel * self.obs_scales.ang_vel,
-                    imu_projected_gravity,
-                    (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                    self.dof_vel * self.obs_scales.dof_vel,
-                    self.actions[:, self.lower_dof_indices],
-                ),
-                dim=-1,
-            )
         current_actor_obs = torch.clone(current_obs)
         if self.add_noise:
             current_actor_obs += (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec[
-                0 : (10 + (9 if self.freq_control else 0) + 2 * self.num_actions + self.num_lower_dof)
+                0 : (10 + 2 * self.num_actions + self.num_lower_dof)
             ]
         self.obs_buf = torch.cat(
             (
@@ -527,58 +497,36 @@ class Flomo(BaseTask):
                 torch.clip(self.root_states[:, 2].unsqueeze(1) - 1.0 - self.measured_heights, -1, 1.0)
                 * self.obs_scales.height_measurements
             )
+            # self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, heights), dim=-1)
             if self.add_noise:
                 heights = self._add_height_noise(heights)
+            # print("heights[0].view(11, 11)", heights[0].view(15, 15))
             self.obs_buf = torch.cat((self.obs_buf, heights), dim=-1)
+            # self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, heights), dim=-1)
 
     def compute_termination_observations(self, env_ids):
-        is_standing = torch.norm(self.commands[:, :3], dim=1) < 0.1
-        processed_clock_inputs = torch.where(
-            is_standing.unsqueeze(1).repeat(1, 2), torch.ones_like(self.clock_inputs), self.clock_inputs
-        )
+        """Computes observations"""
         imu_ang_vel = quat_rotate_inverse(
             self.rigid_body_states[:, self.imu_index, 3:7], self.rigid_body_states[:, self.imu_index, 10:13]
         )
         imu_projected_gravity = quat_rotate_inverse(self.rigid_body_states[:, self.imu_index, 3:7], self.gravity_vec)
-        torso_imu_ang_vel = quat_rotate_inverse(
-            self.rigid_body_states[:, self.torso_imu_index, 3:7], self.rigid_body_states[:, self.torso_imu_index, 10:13]
+        current_obs = torch.cat(
+            (
+                self.commands[:, :3] * self.commands_scale,
+                self.commands[:, 4].unsqueeze(1),
+                imu_ang_vel * self.obs_scales.ang_vel,
+                imu_projected_gravity,
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+                self.dof_vel * self.obs_scales.dof_vel,
+                self.actions[:, self.lower_dof_indices],
+            ),
+            dim=-1,
         )
-        torso_imu_projected_vel = quat_rotate_inverse(
-            self.rigid_body_states[:, self.torso_imu_index, 3:7], self.gravity_vec
-        )
-        if self.freq_control:
-            current_obs = torch.cat(
-                (
-                    self.commands[:, :3] * self.commands_scale,
-                    self.commands[:, 4:6],
-                    imu_ang_vel * self.obs_scales.ang_vel,
-                    imu_projected_gravity,
-                    torso_imu_ang_vel * self.obs_scales.ang_vel,
-                    torso_imu_projected_vel,
-                    (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                    self.dof_vel * self.obs_scales.dof_vel,
-                    self.actions[:, self.lower_dof_indices],
-                    processed_clock_inputs,
-                ),
-                dim=-1,
-            )
-        else:
-            current_obs = torch.cat(
-                (
-                    self.commands[:, :3] * self.commands_scale,
-                    self.commands[:, 4].unsqueeze(1),
-                    imu_ang_vel * self.obs_scales.ang_vel,
-                    imu_projected_gravity,
-                    (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                    self.dof_vel * self.obs_scales.dof_vel,
-                    self.actions[:, self.lower_dof_indices],
-                ),
-                dim=-1,
-            )
 
+        # add noise if needed
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[
-                0 : (10 + (9 if self.freq_control else 0) + 2 * self.num_actions + self.num_lower_dof)
+                0 : (10 + 2 * self.num_actions + self.num_lower_dof)
             ]
         current_critic_obs = torch.cat((current_obs, self.base_lin_vel * self.obs_scales.lin_vel), dim=-1)
         return torch.cat(
@@ -650,6 +598,7 @@ class Flomo(BaseTask):
         cam_target = gymapi.Vec3(lookat[0], lookat[1], lookat[2])
         self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
 
+    # ------------- Callbacks --------------
     def _process_rigid_shape_props(self, props, env_id):
         """Callback allowing to store/change/randomize the rigid shape properties of each environment.
             Called During environment creation.
@@ -795,14 +744,13 @@ class Flomo(BaseTask):
         """Callback called before computing terminations, rewards, and observations
         Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
         """
+        #
         env_ids = (
             (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt) == 0)
             .nonzero(as_tuple=False)
             .flatten()
         )
         self._resample_commands(env_ids)
-        if self.freq_control:
-            self._step_contact_targets()
 
         if self.cfg.terrain.measure_heights and self.cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
             self.measured_heights = self._get_heights()
@@ -810,31 +758,9 @@ class Flomo(BaseTask):
         if self.cfg.domain_rand.push_robots and (self.common_step_counter % self.cfg.domain_rand.push_interval == 0):
             self._push_robots()
 
-    def _step_contact_targets(self):
-        frequencies = self.commands[:, 5]
-        self.gait_indices = torch.remainder(self.gait_indices + self.dt * frequencies, 1.0)
-        durations = torch.full_like(self.gait_indices, 0.5)
-        phases = 0.5
-        kappa = 0.07
-        foot_indices = [
-            self.gait_indices + phases,  # FL
-            self.gait_indices,  # FR
-        ]
-        self.foot_indices = torch.remainder(torch.cat([foot_indices[i].unsqueeze(1) for i in range(2)], dim=1), 1.0)
-        for fi in foot_indices:
-            stance = fi < durations
-            swing = fi >= durations
-            fi[stance] = fi[stance] * (0.5 / durations[stance])
-            fi[swing] = 0.5 + (fi[swing] - durations[swing]) * (0.5 / (1 - durations[swing]))
-
-        self.clock_inputs = torch.stack([torch.sin(2 * np.pi * fi) for fi in foot_indices], dim=1)
-        cdf = torch.distributions.Normal(0, kappa).cdf
-
-        def smooth(fi):
-            f = torch.remainder(fi, 1.0)
-            return cdf(f) * (1 - cdf(f - 0.5)) + cdf(f - 1) * (1 - cdf(f - 1 - 0.5))
-
-        self.desired_contact_states = torch.stack([smooth(fi) for fi in foot_indices], dim=1)
+    def discretize_speed(self, speeds: torch.Tensor, K: float) -> torch.Tensor:
+        half = K * 0.5
+        return torch.floor((speeds + half) / K) * K
 
     def _resample_commands(self, env_ids):
         """Randommly select commands of some environments
@@ -927,14 +853,6 @@ class Flomo(BaseTask):
 
             self.commands[env_ids, :3] *= (torch.norm(self.commands[env_ids, :3], dim=1) > 0.1).unsqueeze(1)
 
-        if self.freq_control:
-            self.commands[env_ids, 5] = torch_rand_float(
-                self.command_ranges["frequency"][0],
-                self.command_ranges["frequency"][1],
-                (len(env_ids), 1),
-                device=self.device,
-            ).squeeze(1)
-
     def _compute_torques(self, actions):
         """Compute torques from actions.
             Actions can be interpreted as position or velocity targets given to a PD controller, or directly as scaled torques.
@@ -976,9 +894,6 @@ class Flomo(BaseTask):
             control[..., self.lower_dof_indices] = torques[..., self.lower_dof_indices]
             control[..., self.upper_dof_indices] = self.joint_pos_target[..., self.upper_dof_indices]
             return control
-            # return torch.cat(
-            #     (torques[..., self.lower_dof_indices], self.joint_pos_target[..., self.num_lower_dof :]), dim=-1
-            # )
 
         else:
             raise NameError(f"Unknown controller type: {control_type}")
@@ -1074,6 +989,7 @@ class Flomo(BaseTask):
         Args:
             env_ids (List[int]): ids of environments being reset
         """
+        # If the tracking reward is above 75% of the maximum, increase the range of commands
         if (
             torch.mean(self.episode_sums["tracking_x_vel"][env_ids]) / self.max_episode_length
             > 0.8 * self.reward_scales["tracking_x_vel"]
@@ -1107,7 +1023,9 @@ class Flomo(BaseTask):
         Args:
             env_ids (List[int]): ids of environments being reset
         """
+        # Implement Terrain curriculum
         if not self.init_done:
+            # don't change on initial reset
             return
         distance = torch.norm(self.root_states[env_ids, :2] - self.env_origins[env_ids, :2], dim=1)
 
@@ -1123,6 +1041,7 @@ class Flomo(BaseTask):
         move_down = 0
 
         self.terrain_levels[env_ids] = self.terrain_levels[env_ids] + 1 * move_up - 1 * move_down
+        # Robots that solve the last level are sent to a random one
         self.terrain_levels[env_ids] = torch.where(
             self.terrain_levels[env_ids] >= self.max_terrain_level,
             torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
@@ -1130,9 +1049,6 @@ class Flomo(BaseTask):
         )  # (the minumum level is zero)
 
         self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
-        self.platform_length[env_ids] = self.terrain_platform_length[
-            self.terrain_levels[env_ids], self.terrain_types[env_ids]
-        ]
 
     def _get_noise_scale_vec(self, cfg):
         """Sets a vector used to scale the noise added to the observations.
@@ -1144,40 +1060,23 @@ class Flomo(BaseTask):
         Returns:
             [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
         """
-        if self.freq_control:
-            noise_vec = torch.zeros(13 + 6 + 2 * self.num_actions + self.num_lower_dof, device=self.device)
-            self.add_noise = self.cfg.noise.add_noise
-            noise_scales = self.cfg.noise.noise_scales
-            noise_level = self.cfg.noise.noise_level
-            noise_vec[0:5] = 0.0  # commands
-            noise_vec[5:8] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-            noise_vec[8:11] = noise_scales.gravity * noise_level
-            noise_vec[11:14] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-            noise_vec[14:17] = noise_scales.gravity * noise_level
-            noise_vec[17 : (17 + self.num_actions)] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-            noise_vec[(17 + self.num_actions) : (17 + 2 * self.num_actions)] = (
-                noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-            )
-            noise_vec[(17 + 2 * self.num_actions) : (17 + 2 + 2 * self.num_actions + self.num_lower_dof)] = (
-                0.0  # previous actions
-            )
-        else:
-            noise_vec = torch.zeros(10 + 2 * self.num_actions + self.num_lower_dof, device=self.device)
-            self.add_noise = self.cfg.noise.add_noise
-            noise_scales = self.cfg.noise.noise_scales
-            noise_level = self.cfg.noise.noise_level
-            noise_vec[0:4] = 0.0  # commands
-            noise_vec[4:7] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-            noise_vec[7:10] = noise_scales.gravity * noise_level
-            noise_vec[10 : (10 + self.num_actions)] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-            noise_vec[(10 + self.num_actions) : (10 + 2 * self.num_actions)] = (
-                noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-            )
-            noise_vec[(10 + 2 * self.num_actions) : (10 + 2 * self.num_actions + self.num_lower_dof)] = (
-                0.0  # previous actions
-            )
+        noise_vec = torch.zeros(10 + 2 * self.num_actions + self.num_lower_dof, device=self.device)
+        self.add_noise = self.cfg.noise.add_noise
+        noise_scales = self.cfg.noise.noise_scales
+        noise_level = self.cfg.noise.noise_level
+        noise_vec[0:4] = 0.0  # commands
+        noise_vec[4:7] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+        noise_vec[7:10] = noise_scales.gravity * noise_level
+        noise_vec[10 : (10 + self.num_actions)] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        noise_vec[(10 + self.num_actions) : (10 + 2 * self.num_actions)] = (
+            noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+        )
+        noise_vec[(10 + 2 * self.num_actions) : (10 + 2 * self.num_actions + self.num_lower_dof)] = (
+            0.0  # previous actions
+        )
         return noise_vec
 
+    # ----------------------------------------
     def _init_buffers(self):
         """Initialize torch tensors which will contain simulation states and processed quantities"""
         # get gym GPU state tensors
@@ -1322,6 +1221,7 @@ class Flomo(BaseTask):
             (self.num_envs, self.num_actions - self.num_lower_dof), device=self.device
         )
         self.delta_upper_actions = torch.zeros((self.num_envs, 1), device=self.device)
+        # randomize kp, kd, motor strength
         self.Kp_factors = torch.ones(
             self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False
         )
@@ -1404,19 +1304,15 @@ class Flomo(BaseTask):
                 device=self.device,
             )
 
+        # store friction and restitution
         self.friction_coeffs = torch.ones(self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False)
         self.restitution_coeffs = torch.zeros(
             self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False
         )
 
+        # joint powers
         self.joint_powers = torch.zeros(
             self.num_envs, 100, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False
-        )
-
-        self.gait_indices = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.clock_inputs = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
-        self.desired_contact_states = torch.zeros(
-            self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False
         )
 
     def _prepare_reward_function(self):
@@ -1425,6 +1321,8 @@ class Flomo(BaseTask):
         """
         # remove zero scales + multiply non-zero ones by dt
         for key in list(self.reward_scales.keys()):
+            if callable(self.reward_scales[key]) or not isinstance(self.reward_scales[key], Number):
+                continue
             scale = self.reward_scales[key]
             if scale == 0:
                 self.reward_scales.pop(key)
@@ -1434,6 +1332,8 @@ class Flomo(BaseTask):
         self.reward_functions = []
         self.reward_names = []
         for name, scale in self.reward_scales.items():
+            if callable(self.reward_scales[name]) or not isinstance(self.reward_scales[name], Number):
+                continue
             if name == "termination":
                 continue
             self.reward_names.append(name)
@@ -1810,78 +1710,78 @@ class Flomo(BaseTask):
             if self.fix_waist:
                 dof_props["driveMode"][12:].fill(gymapi.DOF_MODE_POS)
                 dof_props["stiffness"][12:] = [
-                    300.0,
                     200.0,
-                    200.0,
-                    200.0,
-                    100.0,
-                    20.0,
-                    20.0,
-                    20.0,
-                    200.0,
-                    200.0,
-                    200.0,
-                    100.0,
-                    20.0,
-                    20.0,
-                    20.0,
+                    40.0,
+                    40.0,
+                    25.0,
+                    25.0,
+                    10.0,
+                    10.0,
+                    10.0,
+                    40.0,
+                    40.0,
+                    25.0,
+                    25.0,
+                    10.0,
+                    10.0,
+                    10.0,
                 ]
                 dof_props["damping"][12:] = [
                     5.0000,
-                    4.0000,
-                    4.0000,
-                    4.0000,
                     1.0000,
-                    0.5000,
-                    0.5000,
-                    0.5000,
-                    4.0000,
-                    4.0000,
-                    4.0000,
                     1.0000,
-                    0.5000,
-                    0.5000,
-                    0.5000,
+                    1.0000,
+                    1.0000,
+                    0.2500,
+                    0.2500,
+                    0.2500,
+                    1.0000,
+                    1.0000,
+                    1.0000,
+                    1.0000,
+                    0.2500,
+                    0.2500,
+                    0.2500,
                 ]
             else:
                 # handle waist yaw joint (user input)
                 # waist roll and pitch joints are policy controlled
                 dof_props["driveMode"][12] = gymapi.DOF_MODE_POS
-                dof_props["stiffness"][12] = 300.0
+                dof_props["stiffness"][12] = 200.0
                 dof_props["damping"][12] = 5.0
                 # handle other user input joints
                 dof_props["driveMode"][15:] = gymapi.DOF_MODE_POS
                 dof_props["stiffness"][15:] = [
-                    200.0,
-                    200.0,
-                    200.0,
-                    100.0,
-                    20.0,
-                    20.0,
-                    20.0,
-                    200.0,
-                    200.0,
-                    200.0,
-                    100.0,
-                    20.0,
-                    20.0,
-                    20.0,
+                    40.0,
+                    40.0,
+                    25.0,
+                    25.0,
+                    10.0,
+                    10.0,
+                    10.0,
+                    40.0,
+                    40.0,
+                    25.0,
+                    25.0,
+                    10.0,
+                    10.0,
+                    10.0,
                 ]
                 dof_props["damping"][15:] = [
-                    4.0000,
-                    4.0000,
-                    4.0000,
                     1.0000,
-                    0.5000,
-                    0.5000,
-                    0.5000,
-                    4.0000,
-                    4.0000,
-                    4.0000,
                     1.0000,
-                    0.5000,
-                    0.5000,
-                    0.5000,
+                    1.0000,
+                    1.0000,
+                    0.2500,
+                    0.2500,
+                    0.2500,
+                    1.0000,
+                    1.0000,
+                    1.0000,
+                    1.0000,
+                    0.2500,
+                    0.2500,
+                    0.2500,
                 ]
 
             armature = []
@@ -2081,10 +1981,6 @@ class Flomo(BaseTask):
             self.max_terrain_level = self.cfg.terrain.max_terrain_level
             self.terrain_origins = torch.from_numpy(self.terrain.env_origins).to(self.device).to(torch.float)
             self.env_origins[:] = self.terrain_origins[self.terrain_levels, self.terrain_types]
-            self.terrain_platform_length = (
-                torch.from_numpy(self.terrain.platform_length).to(self.device).to(torch.float)
-            )
-            self.platform_length = self.terrain_platform_length[self.terrain_levels, self.terrain_types]
         else:
             self.custom_origins = False
             self.env_origins = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
@@ -2100,8 +1996,8 @@ class Flomo(BaseTask):
     def _parse_cfg(self, cfg):
         self.dt = self.cfg.control.decimation * self.sim_params.dt
         self.obs_scales = self.cfg.normalization.obs_scales
-        self.reward_scales = self.cfg.rewards.scales
-        self.command_ranges = self.cfg.commands.ranges
+        self.reward_scales = class_to_dict(self.cfg.rewards.scales)
+        self.command_ranges = class_to_dict(self.cfg.commands.ranges)
         if self.cfg.terrain.mesh_type not in ["heightfield", "trimesh"]:
             self.cfg.terrain.curriculum = False
         self.max_episode_length_s = self.cfg.env.episode_length_s
@@ -2350,20 +2246,13 @@ class Flomo(BaseTask):
         for i in range(len(self.feet_indices)):
             feetvel_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_feetvel_translated[:, i, :])
         feet_height, feet_height_var, _ = self._get_feet_heights()
-        if self.freq_control:
-            phases = 1 - torch.abs(1.0 - torch.clip((self.foot_indices * 2.0) - 1.0, 0.0, 1.0) * 2.0)
-            height_target = self.cfg.rewards.clearance_height_target * phases
-            height_error = torch.square(feet_height - height_target).view(self.num_envs, -1)
-            # feet_leteral_vel = torch.sqrt(torch.sum(torch.square(feetvel_in_body_frame[:, :, :2]), dim=2)).view(self.num_envs, -1)
-            return torch.sum(height_error, dim=1) * (torch.norm(self.commands[:, :3], dim=1) > 0.1)
-        else:
-            height_error = torch.square(feet_height - self.cfg.rewards.clearance_height_target).view(self.num_envs, -1)
-            feet_leteral_vel = torch.sqrt(torch.sum(torch.square(feetvel_in_body_frame[:, :, :2]), dim=2)).view(
-                self.num_envs, -1
-            )
-            return torch.sum(height_error * feet_leteral_vel, dim=1) * torch.clip(
-                (torch.norm(self.commands[:, :3], dim=1) - 0.1) / 0.2, min=0.0, max=1.0
-            )
+        height_error = torch.square(feet_height - self.cfg.rewards.clearance_height_target).view(self.num_envs, -1)
+        feet_leteral_vel = torch.sqrt(torch.sum(torch.square(feetvel_in_body_frame[:, :, :2]), dim=2)).view(
+            self.num_envs, -1
+        )
+        return torch.sum(height_error * feet_leteral_vel, dim=1) * torch.clip(
+            (torch.norm(self.commands[:, :3], dim=1) - 0.1) / 0.2, min=0.0, max=1.0
+        )
 
     def _reward_feet_distance_lateral(self):
         cur_footpos_translated = self.feet_pos - self.root_states[:, 0:3].unsqueeze(1)
@@ -2496,29 +2385,9 @@ class Flomo(BaseTask):
 
     def _reward_stand_still(self):
         # Penalize motion at zero commands
-        # lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
         contacts = torch.sum(self.contact_forces[:, self.feet_indices, 2] < 0.1, dim=-1)  # no contact
         error_sim = contacts
-        # error_sim = torch.sum(torch.abs(self.dof_pos - self.default_dof_pos)[:, :12], dim=1) * (self.commands[:, 4] > 0.72)
         return error_sim * (torch.norm(self.commands[:, :3], dim=1) < 0.1)
-
-    def _reward_tracking_contacts_shaped_force(self):
-        if not self.freq_control:
-            return torch.zeros(self.num_envs, device=self.device, requires_grad=False)
-        foot_forces = torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1)
-        reward = 0
-        for i in range(2):
-            reward += -(1 - self.desired_contact_states[:, i]) * (1 - torch.exp(-1 * foot_forces[:, i] ** 2 / 100.0))
-        return (reward / 4) * (torch.norm(self.commands[:, :3], dim=1) > 0.1)
-
-    def _reward_tracking_contacts_shaped_vel(self):
-        if not self.freq_control:
-            return torch.zeros(self.num_envs, device=self.device, requires_grad=False)
-        foot_velocities = torch.norm(self.feet_vel, dim=2).view(self.num_envs, -1)
-        reward = 0
-        for i in range(2):
-            reward += -(self.desired_contact_states[:, i] * (1 - torch.exp(-1 * foot_velocities[:, i] ** 2 / 10.0)))
-        return (reward / 4) * (torch.norm(self.commands[:, :3], dim=1) > 0.1)
 
     def _reward_low_speed(self):
         """
@@ -2576,41 +2445,32 @@ class Flomo(BaseTask):
         waist_action = self.dof_pos[:, self.waist_active_joint_indices]
         return torch.exp(-30 * waist_action.abs()[:, 0]) + torch.exp(-30 * waist_action.abs()[:, 1])
 
-    def _reward_hip_yaw_action(self):
-        assert False
-        hip_yaw_action = self.dof_pos[:, self.hip_yaw_joint_indices]
-        rew = (torch.exp(-30 * hip_yaw_action.abs()[:, 0]) + torch.exp(-30 * hip_yaw_action.abs()[:, 1])) / 2
-        # penalize hip yaw action when x vel is large
-        return torch.where(torch.norm(self.commands[:, [0]], dim=1) > 0.6, rew, torch.ones_like(rew))
+    def _reward_hip_roll_yaw_action(self):
 
-    def _reward_wrist_acc(self):
-        assert False
-        left_wrist_vel = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[
-            :, self.left_wrist_handle, 7:10
-        ]
-        left_wrist_ang_vel = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[
-            :, self.left_wrist_handle, 10:13
-        ]
-        right_wrist_vel = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[
-            :, self.right_wrist_handle, 7:10
-        ]
-        right_wrist_ang_vel = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[
-            :, self.right_wrist_handle, 10:13
-        ]
-
-        left_wrist_lin_vel_a = self.left_acc_lin_vel(left_wrist_vel)
-        left_wrist_ang_vel_a = self.left_acc_ang_vel(left_wrist_ang_vel)
-        right_wrist_lin_vel_a = self.right_acc_lin_vel(right_wrist_vel)
-        right_wrist_ang_vel_a = self.right_acc_ang_vel(right_wrist_ang_vel)
-
-        left_wrist_lin_vel_a = torch.sqrt(torch.sum(torch.square(left_wrist_lin_vel_a), dim=1))
-        left_wrist_ang_vel_a = torch.sqrt(torch.sum(torch.square(left_wrist_ang_vel_a), dim=1))
-        right_wrist_lin_vel_a = torch.sqrt(torch.sum(torch.square(right_wrist_lin_vel_a), dim=1))
-        right_wrist_ang_vel_a = torch.sqrt(torch.sum(torch.square(right_wrist_ang_vel_a), dim=1))
-
-        return 0.25 * (
-            torch.exp(-left_wrist_lin_vel_a / 2)
-            + torch.exp(-left_wrist_ang_vel_a / 10)
-            + torch.exp(-right_wrist_lin_vel_a / 2)
-            + torch.exp(-right_wrist_ang_vel_a / 10)
+        hip_roll_yaw_action = self.dof_pos[:, self.hip_roll_yaw_joint_indices]
+        penalize = torch.sum(
+            torch.square(hip_roll_yaw_action - self.default_dof_pos[:, self.hip_roll_yaw_joint_indices]),
+            dim=-1,
+            keepdim=True,
         )
+        factor = (torch.clip(self.commands[:, 0] - 1.0, min=0.0, max=1.0)).unsqueeze(-1)
+        return (penalize * factor).squeeze(-1)
+
+    def _reward_imu_stand_still(self):
+        """
+        Penalizes the robot's IMU readings when the robot is expected to be stationary.
+        This function checks if the robot is not moving and applies a penalty based on the IMU readings.
+        """
+        imu_ang_vel = quat_rotate_inverse(
+            self.rigid_body_states[:, self.imu_index, 3:7], self.rigid_body_states[:, self.imu_index, 10:13]
+        )
+        torso_imu_ang_vel = quat_rotate_inverse(
+            self.rigid_body_states[:, self.torso_imu_index, 3:7], self.rigid_body_states[:, self.torso_imu_index, 10:13]
+        )
+        still_condition = torch.norm(self.commands[:, :3], dim=1) < 0.1
+        imu_ang_vel = torch.mean(torch.square(imu_ang_vel), dim=1)
+        torso_imu_ang_vel = torch.mean(torch.square(torso_imu_ang_vel), dim=1)
+
+        return still_condition * (
+            imu_ang_vel + torso_imu_ang_vel
+        )  # penalize both IMU and torso IMU angular velocities when stationary

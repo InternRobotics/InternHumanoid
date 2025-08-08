@@ -4,7 +4,9 @@
 
 # ⚡ Training & Playing
 
-A quick guide to training and evaluating universal motion trackers for humanoid robots using InternHumanoid.
+A quick guide to training and evaluating universal motion trackers for humanoid robots using **InternHumanoid**.
+
+For command-conditioned humanoid control and upper-body manipulation, see the reference application [Flomo (Foundation Locomotion)](./flomo_doc/flomo_train_and_play.md).
 
 ---
 
@@ -44,7 +46,7 @@ python legged_gym/scripts/train.py +algo=ppo +robot=g1/g1_29dof +task=imitation/
 After training, play the saved checkpoint with:
 
 ```bash
-python legged_gym/scripts/play.py +algo=ppo +robot=g1/g1_29dof +task=imitation/g1_29dof
+python legged_gym/scripts/motion_imitation/play.py +algo=ppo +robot=g1/g1_29dof +task=imitation/g1_29dof
 ```
 
 - By default, the last model of the last run in the experiment folder is loaded.

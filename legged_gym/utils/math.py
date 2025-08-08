@@ -70,6 +70,15 @@ def quat_mul(a, b):
     return torch.stack([x, y, z, w], dim=-1)
 
 # @torch.jit.script
+def quat_apply(a, b):
+    shape = b.shape
+    a = a.reshape(-1, 4)
+    b = b.reshape(-1, 3)
+    xyz = a[:, :3]
+    t = xyz.cross(b, dim=-1) * 2
+    return (b + a[:, 3:] * t + xyz.cross(t, dim=-1)).view(shape)
+
+# @torch.jit.script
 def quat_mul_inverse(a, b):
     return quat_mul(quat_conjugate(a), b)
 
@@ -275,6 +284,60 @@ def torch_rand_float(lower, upper, shape, device):
 # @torch.jit.script
 def torch_rand_like_float(lower, upper, tensor):
     return (upper - lower) * torch.rand_like(tensor) + lower
+
+# @ torch.jit.script
+def quat_apply_yaw(quat, vec):
+    quat_yaw = quat.clone().view(-1, 4)
+    quat_yaw[:, :2] = 0.0
+    quat_yaw = normalize(quat_yaw)
+    return quat_apply(quat_yaw, vec)
+
+def quat_from_euler_xyz(roll, pitch, yaw):
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+    cr = torch.cos(roll * 0.5)
+    sr = torch.sin(roll * 0.5)
+    cp = torch.cos(pitch * 0.5)
+    sp = torch.sin(pitch * 0.5)
+
+    qw = cy * cr * cp + sy * sr * sp
+    qx = cy * sr * cp - sy * cr * sp
+    qy = cy * cr * sp + sy * sr * cp
+    qz = sy * cr * cp - cy * sr * sp
+
+    return torch.stack([qx, qy, qz, qw], dim=-1)
+
+def euler_from_quaternion_squeeze(quat_angle):
+    """
+    Convert a quaternion into euler angles (roll, pitch, yaw)
+    roll is rotation around x in radians (counterclockwise)
+    pitch is rotation around y in radians (counterclockwise)
+    yaw is rotation around z in radians (counterclockwise)
+    """
+    x = quat_angle[:, 0]
+    y = quat_angle[:, 1]
+    z = quat_angle[:, 2]
+    w = quat_angle[:, 3]
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = torch.atan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = torch.clip(t2, -1, 1)
+    pitch_y = torch.asin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = torch.atan2(t3, t4)
+
+    return roll_x, pitch_y, yaw_z
+
+def get_yaw_quat_from_quat(quat_angle):
+    roll, pitch, yaw = euler_from_quaternion_squeeze(quat_angle)
+    roll = torch.zeros_like(roll)
+    pitch = torch.zeros_like(pitch)
+    return quat_from_euler_xyz(roll, pitch, yaw)
+
 
 def get_axis_params(value, axis_idx, x_value=0., dtype=np.float32, n_dims=3):
     """construct arguments to `Vec` according to axis index.

@@ -1,0 +1,43 @@
+# @package _global_
+algo:
+    seed: 1
+    runner_class_name: "HIMOnPolicyRunner"
+    policy:
+      init_noise_std: 1.0
+      actor_hidden_dims: [512, 256, 256]
+      critic_hidden_dims: [512, 256, 256]
+      activation: elu
+    algorithm:
+      value_loss_coef: 1.0
+      use_clipped_value_loss: true
+      clip_param: 0.2
+      num_learning_epochs: 5
+      num_mini_batches: 4
+      learning_rate: 0.001
+      schedule: adaptive
+      gamma: 0.99
+      lam: 0.95
+      desired_kl: 0.01
+      max_grad_norm: 1.0
+      use_flip: true
+      entropy_coef: 0.01
+      symmetry_scale: 1.0
+    
+    runner:
+      # logging
+      run_name: ""
+      # load and resume
+      resume: False
+      load_run: -1  # -1: last run
+      checkpoint: -1  # -1: last saved model
+
+      policy_class_name: "HIMActorCritic"
+      algorithm_class_name: "HIMPPO"
+      save_interval: 2000
+      num_steps_per_env: 50
+      max_iterations: 20000
+      experiment_name: "flomo"
+      wandb_project: ""
+      # logger: "wandb"
+      logger: "tensorboard"
+      wandb_user: ""  # enter your own wandb user name here

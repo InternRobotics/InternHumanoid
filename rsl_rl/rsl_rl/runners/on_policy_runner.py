@@ -15,7 +15,7 @@ from tqdm import tqdm
 from typing import Union
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, PPO_DISC, PPO_LATENT
+from rsl_rl.algorithms import PPO, PPO_DISC, PPO_LATENT, HIMPPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import Discriminator, Container, LatentContainer
 from rsl_rl.modules import ActorCritic, ActorCriticLatent, ActorCriticRecurrent

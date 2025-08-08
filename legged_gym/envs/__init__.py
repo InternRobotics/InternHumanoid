@@ -33,10 +33,11 @@ from legged_gym.utils.task_registry import task_registry
 from .base.base_task import BaseTask
 from .base.legged_robot import LeggedRobot
 from .g1.g1_env_im import G1Imitation
+from .g1.g1_env_flomo import Flomo
 
 
 task_registry.register( "base", BaseTask )
 task_registry.register( "legged_robot", LeggedRobot )
 task_registry.register( "g1_im", G1Imitation )
-
+task_registry.register( "g1_flomo", Flomo ) # g1 foundation locomotion
 

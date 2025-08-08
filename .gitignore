@@ -9,3 +9,5 @@ logs/
 *DS_Store*
 *.pt*
 *.sh*
+.vscode
+outputs/

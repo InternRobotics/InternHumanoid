@@ -91,6 +91,18 @@ class LatentContainer(nn.Module):
             actor_obs = torch.cat([estimations, observations], dim=-1)        
         action_mean, hidden_a = self.actor_critic.act_inference(actor_obs, self.latents, hidden_states=hidden_a)
         return action_mean, hidden_e, hidden_a
+
+class HIMContainer(torch.nn.Module):
+    def __init__(self, actor_critic):
+        super().__init__()
+        self.actor = actor_critic.actor
+        self.estimator = actor_critic.estimator.encoder
+
+    def forward(self, obs_history):
+        parts = self.estimator(obs_history)
+        vel, z = parts[..., :3], parts[..., 3:]
+        z = F.normalize(z, dim=-1, p=2.0)
+        return self.actor(torch.cat((obs_history[:, -82:], vel, z), dim=1))
     
 
 def get_rnn_initial_states(rnn_module, input):

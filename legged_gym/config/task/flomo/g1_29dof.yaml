@@ -1,0 +1,278 @@
+# @package _global_
+defaults:
+  - /simulator/flomo
+  - /terrain/flomo
+
+task:
+  name: g1_flomo
+  commands:
+    ranges:
+      lin_vel_x: [-0.8, 1.0]
+      lin_vel_y: [-0.5, 0.5]
+      ang_vel_yaw: [-0.8, 0.8]
+      heading: [-3.14, 3.14]
+      height: [-0.4, 0.0]
+    curriculum: false
+    max_curriculum: 1.4
+    num_commands: 5
+    resampling_time: 4.0
+    heading_command: false
+    heading_to_ang_vel: false
+    freq_control: false
+  domain_rand:
+    randomize_joint_injection: true
+    joint_injection_range: [-0.05, 0.05]
+    randomize_actuation_offset: true
+    actuation_offset_range: [-0.05, 0.05]
+    randomize_payload_mass: true
+    payload_mass_range: [-5, 5]
+    randomize_com_displacement: true
+    com_displacement_range: [-0.1, 0.1]
+    randomize_link_mass: true
+    link_mass_range: [0.8, 1.2]
+    randomize_friction: true
+    friction_range: [0.1, 3.0]
+    randomize_restitution: true
+    restitution_range: [0.0, 1.0]
+    randomize_kp: true
+    kp_range: [0.9, 1.1]
+    randomize_kd: true
+    kd_range: [0.9, 1.1]
+    randomize_initial_joint_pos: true
+    initial_joint_pos_scale: [0.8, 1.2]
+    initial_joint_pos_offset: [-0.1, 0.1]
+    push_robots: true
+    push_interval_s: 4
+    max_push_vel_xy: 0.5
+    delay: true
+    use_random: true
+    hand_payload_mass_range: [-0.1, 0.3]
+    backpack_payload_mass_range: [-4, 2]
+    randomize_body_displacement: true
+    body_displacement_range: [-0.1, 0.1]
+    upper_interval_s: 1
+    max_push_vel_z: 0.2
+    init_upper_ratio: 0.0
+  env:
+    scales:
+      termination: -0.0
+      tracking_lin_vel: 1.0
+      tracking_ang_vel: 0.5
+      lin_vel_z: -2.0
+      ang_vel_xy: -0.05
+      orientation: -0.0
+      torques: -1.0e-05
+      dof_vel: -0.0
+      dof_acc: -2.5e-07
+      base_height: -0.0
+      feet_air_time: 1.0
+      collision: -1.0
+      feet_stumble: -0.0
+      action_rate: -0.01
+      stand_still: -0.0
+    num_envs: 4096
+    only_positive_rewards: true
+    tracking_sigma: 0.25
+    soft_dof_pos_limit: 1.0
+    soft_dof_vel_limit: 1.0
+    soft_torque_limit: 1.0
+    base_height_target: 1.0
+    max_contact_force: 100.0
+    clearance_height_target: 0.09
+    least_feet_distance: 0.0
+    least_feet_distance_lateral: 0.0
+    fix_waist: false
+    freq_control: false
+    num_actions: 14
+    num_dofs: 29
+    num_one_step_observations: 82
+    num_one_step_privileged_obs: 85
+    num_actor_history: 6
+    num_critic_history: 1
+    num_height_dim: 0
+    num_observations: 492
+    num_privileged_obs: 85
+    action_curriculum: true
+    env_spacing: 3.0
+    send_timeouts: true
+    episode_length_s: 20
+    upper_teleop: false
+  init_state:
+    pos: [0.0, 0.0, 0.75]
+    rot: [0.0, 0.0, 0.0, 1.0]
+    lin_vel: [0.0, 0.0, 0.0]
+    ang_vel: [0.0, 0.0, 0.0]
+    default_joint_angles:
+      left_hip_yaw_joint: 0.0
+      left_hip_roll_joint: 0
+      left_hip_pitch_joint: -0.1
+      left_knee_joint: 0.3
+      left_ankle_pitch_joint: -0.2
+      left_ankle_roll_joint: 0
+      right_hip_yaw_joint: 0.0
+      right_hip_roll_joint: 0
+      right_hip_pitch_joint: -0.1
+      right_knee_joint: 0.3
+      right_ankle_pitch_joint: -0.2
+      right_ankle_roll_joint: 0
+      waist_yaw_joint: 0.0
+      waist_roll_joint: 0.0
+      waist_pitch_joint: 0.0
+      left_shoulder_pitch_joint: 0.0
+      left_shoulder_roll_joint: 0.0
+      left_shoulder_yaw_joint: 0.0
+      left_elbow_joint: 0.0
+      left_wrist_roll_joint: 0.0
+      left_wrist_pitch_joint: 0.0
+      left_wrist_yaw_joint: 0.0
+      left_hand_index_0_joint: 0.0
+      left_hand_index_1_joint: 0.0
+      left_hand_middle_0_joint: 0.0
+      left_hand_middle_1_joint: 0.0
+      left_hand_thumb_0_joint: 0.0
+      left_hand_thumb_1_joint: 0.0
+      left_hand_thumb_2_joint: 0.0
+      right_shoulder_pitch_joint: 0.0
+      right_shoulder_roll_joint: -0.0
+      right_shoulder_yaw_joint: 0.0
+      right_elbow_joint: 0.0
+      right_wrist_roll_joint: 0.0
+      right_wrist_pitch_joint: 0.0
+      right_wrist_yaw_joint: 0.0
+      right_hand_index_0_joint: 0.0
+      right_hand_index_1_joint: 0.0
+      right_hand_middle_0_joint: 0.0
+      right_hand_middle_1_joint: 0.0
+      right_hand_thumb_0_joint: 0.0
+      right_hand_thumb_1_joint: 0.0
+      right_hand_thumb_2_joint: 0.0
+    joint_armature:
+      left_hip_pitch_joint: 0.0103
+      left_hip_roll_joint: 0.0251
+      left_hip_yaw_joint: 0.0103
+      left_knee_joint: 0.0251
+      left_ankle_pitch_joint: 0.003597
+      left_ankle_roll_joint: 0.003597
+      right_hip_pitch_joint: 0.0103
+      right_hip_roll_joint: 0.0251
+      right_hip_yaw_joint: 0.0103
+      right_knee_joint: 0.0251
+      right_ankle_pitch_joint: 0.003597
+      right_ankle_roll_joint: 0.003597
+      waist_yaw_joint: 0.0103
+      waist_roll_joint: 0.0103
+      waist_pitch_joint: 0.0103
+      left_shoulder_pitch_joint: 0.003597
+      left_shoulder_roll_joint: 0.003597
+      left_shoulder_yaw_joint: 0.003597
+      left_elbow_joint: 0.003597
+      left_wrist_roll_joint: 0.01
+      left_wrist_pitch_joint: 0.01
+      left_wrist_yaw_joint: 0.01
+      left_hand_index_0_joint: 0.01
+      left_hand_index_1_joint: 0.01
+      left_hand_middle_0_joint: 0.01
+      left_hand_middle_1_joint: 0.01
+      left_hand_thumb_0_joint: 0.01
+      left_hand_thumb_1_joint: 0.01
+      left_hand_thumb_2_joint: 0.01
+      right_shoulder_pitch_joint: 0.003597
+      right_shoulder_roll_joint: 0.003597
+      right_shoulder_yaw_joint: 0.003597
+      right_elbow_joint: 0.003597
+      right_wrist_roll_joint: 0.01
+      right_wrist_pitch_joint: 0.01
+      right_wrist_yaw_joint: 0.01
+      right_hand_index_0_joint: 0.01
+      right_hand_index_1_joint: 0.01
+      right_hand_middle_0_joint: 0.01
+      right_hand_middle_1_joint: 0.01
+      right_hand_thumb_0_joint: 0.01
+      right_hand_thumb_1_joint: 0.01
+      right_hand_thumb_2_joint: 0.01
+  noise:
+    height_measurements:
+      extend_prob: 0.5
+      vertical_scale: 0.02
+      offset_range: [-0.05, 0.05]
+      map_max_delay_timesteps: 5
+      map_repeat_prob: 0.2
+    noise_scales:
+      dof_pos: 0.02
+      dof_vel: 2.0
+      lin_vel: 0.1
+      ang_vel: 0.5
+      gravity: 0.05
+    add_noise: true
+    noise_level: 1.0
+  normalization:
+    obs_scales:
+      lin_vel: 2.0
+      ang_vel: 0.5
+      dof_pos: 1.0
+      dof_vel: 0.05
+      height_measurements: 5.0
+    clip_observations: 100.0
+    clip_actions: 100.0
+  rewards:
+    scales:
+      termination: 0
+      tracking_x_vel: 2.0
+      tracking_y_vel: 1.5
+      tracking_ang_vel: 2.0
+      tracking_ang_vel_int: 2.0
+      lin_vel_z: -0.5
+      ang_vel_xy: -0.025
+      orientation: -1.5
+      action_rate: -0.01
+      tracking_base_height: 2.0
+      deviation_hip_joint: -0.2
+      deviation_ankle_joint: -0.5
+      deviation_knee_joint: -0.75
+      deviation_all_joint: 0
+      deviation_arm_joint: 0
+      deviation_leg_joint: 0
+      deviation_waist_joint: 0
+      dof_acc: -2.5e-07
+      dof_pos_limits: -2.0
+      feet_clearance: -0.25
+      feet_distance: 0.0
+      feet_distance_lateral: 1.0
+      knee_distance_lateral: 1.5
+      feet_ground_parallel: -2.0
+      feet_parallel: -3.0
+      smoothness: -0.05
+      joint_power: -2.0e-05
+      torques: -2.5e-06
+      dof_vel: -0.0001
+      dof_vel_limits: -0.002
+      torque_limits: -0.1
+      no_fly: 0.75
+      joint_tracking_error: -0.1
+      feet_slip: -0.25
+      feet_contact_forces: -0.00025
+      contact_momentum: 0.00025
+      action_vanish: -1.0
+      stand_still: -1.0
+      waist_action: 0.5
+      penalize_pelvis_ang_vel: -0.1
+    only_positive_rewards: false
+    tracking_sigma: 0.25
+    soft_dof_pos_limit: 0.975
+    soft_dof_vel_limit: 0.8
+    soft_torque_limit: 0.95
+    base_height_target: 0.74
+    max_contact_force: 400.0
+    clearance_height_target: 0.15
+    least_feet_distance: 0.2
+    least_feet_distance_lateral: 0.2
+    beta_int: 0.2
+    tracking_sigma_int: 0.01
+    most_feet_distance_lateral: 0.3
+    most_knee_distance_lateral: 0.3
+    least_knee_distance_lateral: 0.2
+  viewer:
+    ref_env: 0
+    pos: [10, 0, 6]
+    lookat: [11.0, 5, 3.0]
+  seed: 1

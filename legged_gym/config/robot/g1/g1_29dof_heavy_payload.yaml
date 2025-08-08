@@ -1,0 +1,70 @@
+# @package _global_
+
+robot:
+      control:
+            control_type: M
+            stiffness:
+                  hip_yaw: 100
+                  hip_roll: 100
+                  hip_pitch: 100
+                  knee: 150
+                  ankle: 40
+                  waist: 200
+                  shoulder: 40
+                  wrist: 40
+                  elbow: 40
+                  hand: 2
+            damping:
+                  hip_yaw: 2
+                  hip_roll: 2
+                  hip_pitch: 2
+                  knee: 4
+                  ankle: 2
+                  waist: 5
+                  shoulder: 1
+                  wrist: 1
+                  elbow: 1
+                  hand: 0.2
+            action_scale: 0.25
+            decimation: 4
+            hip_reduction: 1.0
+            curriculum_joints: []
+            fix_waist: false
+      asset:
+            file: "./resources/robots/G1/urdf/g1_29dof_heavy_payload.urdf"
+            name: g1_29dof
+            foot_name: ankle_roll
+            penalize_contacts_on: [hip, knee]
+            terminate_after_contacts_on: [torso]
+            curriculum_joints: []
+            disable_gravity: false
+            collapse_fixed_joints: false
+            fix_base_link: false
+            default_dof_drive_mode: 3
+            self_collisions: 0
+            replace_cylinder_with_capsule: true
+            flip_visual_attachments: false
+            density: 0.001
+            angular_damping: 0.01
+            linear_damping: 0.01
+            max_angular_velocity: 1000.0
+            max_linear_velocity: 1000.0
+            armature: 0.0
+            use_physx_armature: true
+            thickness: 0.01
+            fix_waist: false
+            left_foot_name: left_foot
+            right_foot_name: right_foot
+            left_leg_joints: [left_hip_yaw_joint, left_hip_roll_joint, left_hip_pitch_joint, left_knee_joint, left_ankle_pitch_joint]
+            right_leg_joints: [right_hip_yaw_joint, right_hip_roll_joint, right_hip_pitch_joint, right_knee_joint, right_ankle_pitch_joint]
+            left_hip_joints: [left_hip_roll_joint, left_hip_pitch_joint, left_hip_yaw_joint]
+            right_hip_joints: [right_hip_roll_joint, right_hip_pitch_joint, right_hip_yaw_joint]
+            hip_pitch_joints: [right_hip_pitch_joint, left_hip_pitch_joint]
+            hip_roll_yaw_joints: [left_hip_roll_joint, left_hip_yaw_joint, right_hip_roll_joint, right_hip_yaw_joint]
+            knee_joints: [left_knee_joint, right_knee_joint]
+            ankle_joints: [left_ankle_roll_joint, right_ankle_roll_joint]
+            upper_body_link: torso_link
+            imu_link: imu_in_pelvis
+            imu_torso: imu_in_torso
+            knee_names: [left_knee_link, left_hip_yaw_link, right_knee_link, right_hip_yaw_link]
+            ankle_sole_distance: 0.02

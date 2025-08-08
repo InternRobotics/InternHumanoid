@@ -34,13 +34,14 @@ import os
 import isaacgym
 import torch
 import pickle
+import hydra
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry, export_jit_to_onnx, load_onnx_policy
-from rsl_rl.runners import OnPolicyRunner
+from hydra.utils import get_class
 from easydict import EasyDict
 from omegaconf import OmegaConf, DictConfig
 
-@hydra.main(version_base=None,config_path="../config", config_name="base")
+@hydra.main(version_base=None,config_path="../../config", config_name="base")
 def play(cfg: OmegaConf):
 
     cfg = EasyDict(OmegaConf.to_container(cfg, resolve=True, enum_to_str=True))
@@ -61,12 +62,12 @@ def play(cfg: OmegaConf):
     env_cfg.termination.termination_time = 100.0 # sec
 
     # prepare environment
-    env = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)[0]
+    env = task_registry.make_env(name=env_cfg.name, args=args, env_cfg=env_cfg)[0]
     obs, critic_obs = env.reset()
     commands, critic_commands = env.get_commands()
-    
+    runner_class = get_class(f"rsl_rl.runners.{train_cfg.runner_class_name}")
     runner, train_cfg = task_registry.make_runner(
-        env=env, runner_class=OnPolicyRunner, name=args.task, args=args)
+        env=env, runner_class=runner_class, name=env_cfg.name, args=args)
 
     policy = runner.export_model().to(env.device)
     dof_pos_info = {name: [] for name in env.dof_names}

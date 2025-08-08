@@ -13,10 +13,14 @@ from .network import HyperPolicyHead, HyperValueHead
 from .estimator import EstimatorRecurrent
 from .discriminator import Discriminator
 from .normalization import Normalization
-from .container import Container, LatentContainer
+from .container import Container, LatentContainer, HIMContainer
+
+from .him_actor_critic import HIMActorCritic
+from .him_estimator import HIMEstimator
 
 __all__ = [
     "ActorCritic", "ActorCriticLatent", "ActorCriticRecurrent",
     "HyperEmbedder", "HyperLERPBlock", "HyperPolicyHead", "HyperValueHead",
-    "EstimatorRecurrent", "Discriminator", "Normalization", "Container", "LatentContainer"
+    "EstimatorRecurrent", "Discriminator", "Normalization", "Container", "LatentContainer",
+    "HIMActorCritic", "HIMEstimator", "HIMContainer"
     ]

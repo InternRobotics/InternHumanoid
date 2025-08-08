@@ -36,6 +36,7 @@ import random
 import onnxruntime
 from isaacgym import gymapi
 from isaacgym import gymutil
+import torch.nn.functional as F
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 
