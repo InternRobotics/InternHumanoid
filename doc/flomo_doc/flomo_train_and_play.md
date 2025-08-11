@@ -3,12 +3,14 @@
   <img src="../../doc/InternHumaniod.png" alt="InternHumanoid logo" width="50%">
 </p>
 
-# Flomo (Foundation Locomotion)
+# Flomo (Foundation Loco-Manipulation Control Policy for Humanoid Robots)
 
 <p align="center">
-  <img src="./real.gif" alt="fire-assistance and rescue scenarios" width="36%" style="border-radius:20px; border:1px solid #e5e7eb;">
+  <img src="./gym.gif" alt="play" width="30%" style="border-radius:20px; border:1px solid #e5e7eb; margin:0 1%;">
+  <img src="./mujoco.gif" alt="sim2sim" width="30%" style="border-radius:20px; border:1px solid #e5e7eb; margin:0 1%;">
+  <img src="./real.gif" alt="fire-assistance and rescue scenarios" width="30%" style="border-radius:20px; border:1px solid #e5e7eb; margin:0 1%;">
   <br>
-  <sub>Robot-Assisted Firefighting & Rescue</sub>
+  <sub> Training & Playing | Sim2Sim Evaluation | Robot-Assisted Firefighting & Rescue </sub>
 </p>
 
 A reference application built on **InternHumanoid** that demonstrates *loco-manipulation*—the coordinated combination of locomotion and manipulation—for humanoid robots.
@@ -37,10 +39,6 @@ For additional configuration options and the overall workflow, see the tracking 
 
 ## Playing
 
-<p align="center">
-  <img src="./gym.gif" alt="play" width="26%" style="border-radius:20px; border:1px solid #e5e7eb;">
-</p>
-
 Run the trained checkpoint:
 ```bash
 python legged_gym/scripts/locomotion/play_flomo.py +algo=him_ppo +robot=g1/g1_29dof_heavy_payload +task=flomo/g1_29dof
@@ -53,10 +51,6 @@ Keyboard controls
 * Q – Quit
 
 ## Sim2Sim
-
-<p align="center">
-  <img src="./mujoco.gif" alt="sim2sim" width="26%" style="border-radius:20px; border:1px solid #e5e7eb;">
-</p>
 
 Evaluate robustness to simulator/domain parameter variations (Sim2Sim):
 ```bash
