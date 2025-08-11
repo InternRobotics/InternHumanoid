@@ -24,10 +24,11 @@ A **versatile, all-in-one** toolbox for whole-body humanoid robot control—enab
 
 
 ## 🚧 TODO
-- \[x\]  Release Environments on Unitree G1**
-- \[ \] Release Pre-trained Checkpoints and Training Data**
-- \[ \] Release Environments on Different Robots**
-- \[ \] Release Deployment Codes**
+- \[x\]  Release*Whole Body Control Mode on Unitree G1
+- \[x\]  Release Upper–Lower Body Split Mode on Unitree G1
+- \[ \] Release Pre-trained Checkpoints and Training Data
+- \[ \] Release Environments on Different Robots
+- \[ \] Release Deployment Codes
 
 ---
 
