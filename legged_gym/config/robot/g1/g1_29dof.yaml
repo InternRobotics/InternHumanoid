@@ -5,7 +5,7 @@ robot:
         clip_action: 100.0
         control_type: "P" # P: position, V: velocity, T: torques
         # PD Drive parameters:
-        default_damping_ratio: 1.0 / 20.0
+        default_damping_ratio: 0.05
         stiffness: {"hip": 100, "knee": 100, "ankle": 20, "waist": 500, "shoulder": 20, "elbow": 20, "wrist": 50} # [N*m/rad]
         damping: {"waist": 3, "wrist": 0.5}  # [N*m*s/rad]
         action_names: ["hip", "knee", "ankle", "waist", "shoulder", "elbow"]

@@ -11,8 +11,8 @@ task:
     env_spacing: 5.0  # not used with heightfields/trimeshes
     max_episode_length_sec: 20 # max episode length in seconds
     
-    future_dt: 0.05  # sec
-    future_timesteps: 10
+    motion_dt: 0.05  # sec
+    motion_horizon: 10
 
   init_state:
     pos: [0.0, 0.0, 0.15] # x,y,z [m]
@@ -20,20 +20,21 @@ task:
     lin_vel: [0.0, 0.0, 0.0]  # x,y,z [m/s]
     ang_vel: [0.0, 0.0, 0.0]  # x,y,z [rad/s]
     default_joint_angles: {
-        # upper body joints
-        "left_shoulder_roll_joint": 0.35, 
-        "left_elbow_joint": 0.78,
-        "right_shoulder_roll_joint": -0.35,
-        "right_elbow_joint": 0.78,
-        
-        # lower body joints
-        "left_hip_pitch_joint": -0.2,
-        "left_knee_joint": 0.6,
-        "left_ankle_pitch_joint": -0.4,
-        "right_hip_pitch_joint": -0.2,
-        "right_knee_joint": 0.6,
-        "right_ankle_pitch_joint": -0.4,
+      # upper body joints
+      "left_shoulder_roll_joint": 0.35, 
+      "left_elbow_joint": 0.78,
+      "right_shoulder_roll_joint": -0.35,
+      "right_elbow_joint": 0.78,
+      
+      # lower body joints
+      "left_hip_pitch_joint": -0.3,
+      "left_knee_joint": 0.6,
+      "left_ankle_pitch_joint": -0.3,
+      "right_hip_pitch_joint": -0.3,
+      "right_knee_joint": 0.6,
+      "right_ankle_pitch_joint": -0.3,
         }
+
   # dataset for tracking reference
   tracking_reference:
     prefix: "./resources/dataset/g1_29dof_data"
@@ -132,7 +133,6 @@ task:
     push_robot_body_duration_sec: [0.5, 1.0] # sec
     push_robot_body_max_force: 20 # N
     push_robot_body_max_torque: 20 # N * m
-
 
   rewards:
     scales:

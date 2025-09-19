@@ -40,7 +40,7 @@ algo:
       smoothness_coef: 0.01
     
     runner:
-      policy_class_name: "ActorCritic"
+      policy_class_name: "ActorCriticRecurrent"
       algorithm_class_name: "PPO"
       num_warmup_steps: 100
       num_steps_per_env: 25 # per iteration
