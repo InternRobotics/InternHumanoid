@@ -1,7 +1,7 @@
 # @package _global_
 simulator:
   sim:
-    dt: 0.004
+    dt: 0.005
     substeps: 1
     gravity: [0.0, 0.0, -9.81]
     up_axis: 1
@@ -9,7 +9,7 @@ simulator:
       num_threads: 10
       solver_type: 1
       num_position_iterations: 4
-      num_velocity_iterations: 2
+      num_velocity_iterations: 1
       contact_offset: 0.01
       rest_offset: 0.0
       bounce_threshold_velocity: 0.5

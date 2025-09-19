@@ -5,7 +5,6 @@
 
 from .ppo import PPO
 from .ppo_disc import PPO_DISC
-from .ppo_latent import PPO_LATENT
 from .him_ppo import HIMPPO
 
-__all__ = ["PPO", "PPO_DISC", "PPO_LATENT", "HIMPPO"]
+__all__ = ["PPO", "PPO_DISC", "HIMPPO"]

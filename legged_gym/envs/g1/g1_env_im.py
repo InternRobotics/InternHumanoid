@@ -40,11 +40,12 @@ import torch.nn.functional as F
 
 from legged_gym.utils.geometry import WireframeSphereGeometry
 from legged_gym.utils.terrain import Terrain
+from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.motion_lib import (
     MotionLib, 
     MotionLoader, 
     load_imitation_dataset, 
-    filter_legal_motion,
+    filter_and_fix_motion,
     )
 from legged_gym.utils.math import (
     get_axis_params,
@@ -56,7 +57,7 @@ from legged_gym.utils.math import (
     quat_mul_yaw_inverse,
     quat_rotate_yaw,
     quat_rotate_yaw_inverse,
-    quat_to_tan_norm,
+    quat_to_rot6d,
     quat_to_euler_xyz,
     quat_to_angle_axis,
     euler_xyz_to_quat,
@@ -87,6 +88,8 @@ class G1Imitation:
         sim_device_type, self.sim_device_id = gymutil.parse_device_str(self.sim_device)
         self.headless = headless
         self.height_samples = None
+        self.test_mode = False
+        self.motion_mode = False
         self.debug_viz = True
         self._parse_cfg()
         self.gym = gymapi.acquire_gym()
@@ -103,10 +106,6 @@ class G1Imitation:
         if self.headless:self.graphics_device_id = -1
 
         self.num_envs = cfg.env.num_envs
-        # optimization flags for pytorch JIT
-        torch._C._jit_set_profiling_mode(False)
-        torch._C._jit_set_profiling_executor(False)
-        
         self.extras = {}
         # create envs, sim and viewer
         self.create_sim()
@@ -142,16 +141,15 @@ class G1Imitation:
     def get_commands(self):
         return self.commands_buf, self.critic_commands_buf
     
-    def get_estimations(self):
-        return self.estimations_buf
-    
     def get_policy_states(self):
         return self.states_buf, self.next_states_buf
 
     def get_task_info(self):
         completion, success_rate = self.motions.get_imitation_info()
-        completion, success_rate = completion.item(), success_rate.item()
-        return completion, success_rate
+        return {
+            "total_completion": completion.item(),
+            "total_success_rate": success_rate.item(),
+        }
         
     def reset(self):
         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
@@ -171,8 +169,12 @@ class G1Imitation:
         self.render()
         self.pre_physics_step(actions)        
         for _ in range(self.cfg.control.decimation):
-            self.torques = self._compute_torques(self.actions[:, -1]).view(self.torques.shape)
-            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
+            if self.motion_mode:
+                self.cfg.domain_rand.randomize_initial_joint_position = False
+                self._reset_robot_states(torch.arange(self.num_envs, device=self.device))
+            else:
+                self.torques = self._compute_torques(self.actions[:, -1]).view(self.torques.shape)
+                self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
             self.gym.simulate(self.sim)
             if self.device == "cpu": self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
@@ -208,58 +210,56 @@ class G1Imitation:
         
         # compute observations, rewards, resets, ...
         self.check_deviation()
-        self.compute_rewards()
         self.check_termination()
+        self.compute_rewards()
         
         env_ids = self.reset_buf.nonzero().flatten()
         self.reset_idx(env_ids)
+        
         self.compute_motions()
         self.compute_commands()
-        
-        self.compute_estimations()
         self.compute_observations()
-        # in some cases a simulation step might
-        # be required to refresh some obs (for example body positions)
-
-        self.feet_air_time *= torch.all(~self.feet_contacts, dim=1).float()
-        self.last_dof_vel = self.dof_vel.clone()
-        self.actions[:, :-1] = self.actions[:, 1:]
-        self.feet_contacts[:, :-1] = self.feet_contacts[:, 1:]
-        if self.viewer and self.enable_viewer_sync and self.debug_viz:
-            self._draw_debug_vis()
+        self._post_states_step_callback()
 
     def check_deviation(self):
         """ Check if environments occurred deviation
         """
         deviation_distance = self.cfg.termination.deviation_distance
-        keyframe_pos = torch.cat([self.trunk_pos, self.mobile_pos, self.marker_pos], dim=1)
-        motion_keyframe_pos = torch.cat([
-            self.motion_trunk_pos, self.motion_mobile_pos, self.motion_marker_pos], dim=1)
-        diff_body_dist = torch.norm(keyframe_pos - motion_keyframe_pos, dim=2)
+        
+        diff_local_body_pos = self.motion_local_body_pos - self.local_body_pos
+        diff_body_dist = torch.norm(diff_local_body_pos, dim=2)
         self.deviation = diff_body_dist.amax(dim=1) > deviation_distance
-        self.deviation_time += torch.where(self.deviation, self.dt, 0.0)
-
+        
+        deviation_dist = torch.clip(diff_body_dist - deviation_distance, min=0.0)
+        self.deviation_distance = torch.sum(deviation_dist, dim=1)
+        
+        diff_body_pos = self.motion_body_pos - self.body_pos
+        mix_diff_body_pos = torch.cat([
+            diff_local_body_pos[..., 0:2], diff_body_pos[..., 2:3]], dim=2)
+        max_diff_body_dist = torch.amax(torch.norm(mix_diff_body_pos, dim=2), dim=1)
+        self.max_distance = torch.maximum(max_diff_body_dist, self.max_distance)
+        
     def check_termination(self):
         """ Check if environments need to be reset
         """
         termination_height = self.cfg.termination.termination_height
-        termination_orin = self.cfg.termination.termination_orin
-        termination_time = self.cfg.termination.termination_time
         
-        mean_height = self.measured_heights.mean(dim=1, keepdim=True)
-        robot_trunk_height = self.body_pos[:, self.trunk_indices, 2] - mean_height
-        motion_trunk_height = self.motion_body_pos[:, self.trunk_indices, 2] - mean_height
-        fallen_down = robot_trunk_height.amin(dim=1) < termination_height
-        fallen_down &= motion_trunk_height.amin(dim=1) >= termination_height
+        diff_body_pos = self.motion_body_pos - self.body_pos
+        diff_body_height = torch.abs(
+            diff_body_pos[:, self.end_effector_indices, 2])
+        tracking_fail = diff_body_height.amax(dim=1) > termination_height
+
+        if self.test_mode:
+            tracking_fail = torch.zeros_like(tracking_fail)
+        fallen_down = torch.zeros_like(tracking_fail)
+        if len(self.terminate_contact_indices) > 0:
+            fallen_down |= torch.any(self.terminate_contacts, dim=1)
         
-        diff_body_quat = quat_mul_inverse(self.local_body_quat, self.motion_local_body_quat)
-        diff_trunk_rpy = torch.abs(quat_to_euler_xyz(diff_body_quat[:, self.trunk_indices]))
-        tracking_fail = diff_trunk_rpy.amax(dim=(1, 2)) > termination_orin
-        tracking_fail |= self.deviation_time > termination_time
-        
-        if self.cfg.tracking_reference.resample_motion:
-            self.time_out_buf = self.episode_length_buf > self.max_episode_length
-        else: self.time_out_buf = self.motion_success
+        if self.cfg.tracking_reference.resample_motion and not self.test_mode:
+            resampling = self.episode_length_buf > self.max_episode_length
+        else:
+            resampling = torch.ones_like(self.motion_success)
+        self.time_out_buf = self.motion_success & resampling
         self.reset_buf = fallen_down | tracking_fail | self.time_out_buf
 
     def reset_idx(self, env_ids):
@@ -279,10 +279,11 @@ class G1Imitation:
             self.extras["episode_metrics"][key] = torch.mean(episode_metric)
             self.episode_sums[key][env_ids], self.episode_metrics[key][env_ids] = 0.0, 0.0
         
+        motion_time = self.motion_time[:, self.motion_pivot_id] - self.motion_init_time
+        motion_total_time = self.motions.get_motion_time(self.motion_ids[:, 0])
+        motion_total_time = torch.clip(motion_total_time - self.motion_init_time, min=1e-3)
+        self.extras["completions"] = motion_time / motion_total_time
         self.extras["time_outs"] = self.time_out_buf
-        pivot_motion_time = self.motion_time[:, self.motion_pivot_id]
-        self.extras["completions"] = (pivot_motion_time - self.motion_init_time)
-        self.extras["completions"] /= self.motions.get_motion_time(self.motion_ids[:, self.motion_pivot_id])
         
         self._reset_randomizations(env_ids)
         self._reset_env_origins(env_ids)
@@ -295,12 +296,13 @@ class G1Imitation:
         self.external_forces[env_ids] = 0.0
         self.external_torques[env_ids] = 0.0
         
-        self.deviation_time[env_ids] = 0.0
+        self.max_distance[env_ids] = 0.0
         self.feet_air_time[env_ids] = 0.0
         self.feet_contacts[env_ids] = False
         
         self.reset_buf[env_ids] = True
         self.episode_length_buf[env_ids] = 0
+        self.motion_init_length[env_ids] = 0
         
     def compute_rewards(self):
         """ Compute rewards Calls each reward function which 
@@ -309,18 +311,22 @@ class G1Imitation:
         """
         self.rew_buf[:] = 0.0
         termination_reward = 0.0
-        momentum = self.cfg.rewards.sigma_momentum
+        momentum = self.cfg.rewards.momentum
+        compute_ema = lambda x, y, eps=1e-6: max(eps, (1 - momentum) * x + momentum * y)
         
         for i, function in enumerate(self.reward_functions):
             name = self.reward_names[i]
             reward, metric = function()
             self.episode_metrics[name] += metric
             
-            if "tracking_" in name:
+            if "tracking" in name:
                 original_sigma = self.tracking_sigma[name]
-                error = torch.mean(metric).item()
-                current_sigma = (1.0 - momentum) * original_sigma + momentum * error
+                current_sigma = compute_ema(original_sigma, torch.mean(metric).item())
                 self.tracking_sigma[name] = min(current_sigma, original_sigma)
+            elif "penalty" in name:
+                original_penalty = self.penalty_coefficient[name]
+                current_penalty = compute_ema(original_penalty, torch.mean(metric).item())
+                self.penalty_coefficient[name] = min(current_penalty, original_penalty)
 
             if "termination" in name:
                 scale = self.reward_scales[name] / self.dt
@@ -348,6 +354,10 @@ class G1Imitation:
         robot_base_lin_vel = quat_rotate_inverse(self.base_quat, self.base_lin_vel)
         robot_base_ang_vel = quat_rotate_inverse(self.base_quat, self.base_ang_vel)
         
+        robot_local_body_pos = self.body_pos - self.base_pos[:, None]
+        robot_body_pos = quat_rotate_inverse(self.base_quat[:, None], robot_local_body_pos)
+        robot_end_effector_pos = robot_body_pos[:, self.end_effector_indices]
+        
         robot_dof_pos = (self.dof_pos - self.default_dof_pos)[:, self.action_indices]
         robot_dof_vel = self.dof_vel[:, self.action_indices]
         robot_actions = self.actions[:, -1, self.action_indices]
@@ -358,103 +368,74 @@ class G1Imitation:
         
         base_ang_vel_noise = compute_noise(robot_base_ang_vel, noise_scales.base_ang_vel)
         gravity_noise = compute_noise(self.projected_gravity, noise_scales.gravity)
+        end_effector_pos_noise = compute_noise(robot_end_effector_pos, noise_scales.body_pos)
         dof_pos_noise = compute_noise(robot_dof_pos, noise_scales.dof_pos)
         dof_vel_noise = compute_noise(robot_dof_vel, noise_scales.dof_vel)
-        height_points_noise = compute_noise(self.measured_heights, noise_scales.height_points)
         
         # compute proprioceptions
-        if self.cfg.terrain.measure_heights:
-            height_points = self.base_pos[:, 2:3] - self.measured_heights
-            self.obs_buf = concat([
-                robot_base_ang_vel * obs_scales.base_ang_vel + base_ang_vel_noise,
-                self.projected_gravity * obs_scales.gravity + gravity_noise, 
-                robot_dof_pos * obs_scales.dof_pos + dof_pos_noise, 
-                robot_dof_vel * obs_scales.dof_vel + dof_vel_noise,
-                robot_actions,
-                height_points * obs_scales.height_points + height_points_noise,
-                ])
-            
-            self.critic_obs_buf = concat([
-                robot_base_lin_vel * obs_scales.base_lin_vel,
-                robot_base_ang_vel * obs_scales.base_ang_vel,
-                self.projected_gravity * obs_scales.gravity,
-                robot_dof_pos * obs_scales.dof_pos, 
-                robot_dof_vel * obs_scales.dof_vel,
-                robot_actions,
-                height_points * obs_scales.height_points,
-                ])
-        else:
-            self.obs_buf = concat([                
-                robot_base_ang_vel * obs_scales.base_ang_vel + base_ang_vel_noise,
-                self.projected_gravity * obs_scales.gravity + gravity_noise, 
-                robot_dof_pos * obs_scales.dof_pos + dof_pos_noise, 
-                robot_dof_vel * obs_scales.dof_vel + dof_vel_noise,
-                robot_actions,
-                ])
-            
-            self.critic_obs_buf = concat([
-                robot_base_lin_vel * obs_scales.base_lin_vel,
-                robot_base_ang_vel * obs_scales.base_ang_vel,
-                self.projected_gravity * obs_scales.gravity,
-                robot_dof_pos * obs_scales.dof_pos, 
-                robot_dof_vel * obs_scales.dof_vel,
-                robot_actions,
-                ])
+        self.obs_buf = concat([                
+            robot_base_ang_vel * obs_scales.base_ang_vel + base_ang_vel_noise, 
+            self.projected_gravity * obs_scales.gravity + gravity_noise,
+            robot_end_effector_pos * obs_scales.body_pos + end_effector_pos_noise,
+            robot_dof_pos * obs_scales.dof_pos + dof_pos_noise, 
+            robot_dof_vel * obs_scales.dof_vel + dof_vel_noise,
+            robot_actions,
+            ])
+        
+        self.critic_obs_buf = concat([
+            robot_base_lin_vel * obs_scales.base_lin_vel,
+            robot_base_ang_vel * obs_scales.base_ang_vel,
+            self.projected_gravity * obs_scales.gravity,
+            robot_end_effector_pos * obs_scales.body_pos,
+            robot_dof_pos * obs_scales.dof_pos, 
+            robot_dof_vel * obs_scales.dof_vel,
+            robot_actions,
+            ])
         
         clip_obs = self.cfg.observation.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, min=-clip_obs, max=clip_obs)
         self.critic_obs_buf = torch.clip(self.critic_obs_buf, min=-clip_obs, max=clip_obs)
         
-    def compute_commands(self, motion_dict=None):
-        return_commands = True
-        if motion_dict is None:
-            motion_dict = self.motion_dict
-            return_commands = False
-        
-        batch_size = len(motion_dict["base_pos"])
+    def compute_commands(self):
         clip_obs = self.cfg.observation.clip_observations
         obs_scales = self.cfg.observation.obs_scales
-        concat = lambda xs: torch.cat([x.view(batch_size, -1) for x in xs], dim=-1)
+        concat = lambda xs: torch.cat([x.view(self.num_envs, -1) for x in xs], dim=-1)
             
         # motion observations
-        if return_commands:
-            motion_base_quat = motion_dict["base_quat"]
-        else:
-            motion_base_quat = quat_mul_yaw(self.base_quat_offset[:, None], motion_dict["base_quat"])
-        motion_base_lin_vel = quat_rotate_yaw_inverse(
-            motion_dict["base_quat"][:, self.motion_pivot_id, None], motion_dict["base_lin_vel"])
-        motion_base_ang_vel = quat_rotate_yaw_inverse(
-            motion_dict["base_quat"][:, self.motion_pivot_id, None], motion_dict["base_ang_vel"])
-        motion_dof_pos = (motion_dict["dof_pos"] - self.default_dof_pos)[..., self.motion_dof_indices]
-        motion_dof_pos = motion_dof_pos - motion_dof_pos[:, self.motion_pivot_id, None]
+        motion_pivot_quat = self.motion_dict["base_quat"][:, self.motion_pivot_id, None]
+        
+        motion_base_height = self.motion_dict["base_pos"][..., 2]
+        motion_base_quat = quat_mul_yaw(self.base_quat_offset[:, None], self.motion_dict["base_quat"])
+        motion_base_lin_vel = quat_rotate_yaw_inverse(motion_pivot_quat, self.motion_dict["base_lin_vel"])
+        motion_base_ang_vel = quat_rotate_yaw_inverse(motion_pivot_quat, self.motion_dict["base_ang_vel"])
+        motion_dof_pos = (self.motion_dict["dof_pos"] - self.default_dof_pos)[..., self.motion_dof_indices]
         motion_body_pos = quat_rotate_yaw_inverse(
-            motion_dict["base_quat"][..., None, :], 
-            motion_dict["body_pos"] - motion_dict["base_pos"][..., None, :])
-        motion_body_pos[..., 2] = motion_dict["body_pos"][..., 2]
-        motion_endeffector_pos = motion_body_pos[..., self.endeffector_indices, :]
+            self.motion_dict["base_quat"][..., None, :], 
+            self.motion_dict["body_pos"] - self.motion_dict["base_pos"][..., None, :])
+        motion_body_pos[..., 2] = self.motion_dict["body_pos"][..., 2]
+        motion_end_effector_pos = motion_body_pos[..., self.end_effector_indices, :]
         
         # residual observations
         residual_dof_pos = (self.motion_dof_pos - self.dof_pos)[:, self.motion_dof_indices]
         residual_body_pos = self.motion_local_body_pos - self.local_body_pos
         
-        # convert quat to tan_norm
-        motion_base_tan_norm = quat_to_tan_norm(motion_base_quat)
+        # convert quat to rotation
+        motion_base_rotation = quat_to_rot6d(motion_base_quat)
         
         # compute commands
         commands_buf = concat([
-            motion_base_tan_norm * obs_scales.tan_norm,
+            motion_base_rotation * obs_scales.rotation,
+            motion_base_height * obs_scales.base_pos,
             motion_base_lin_vel * obs_scales.base_lin_vel,
             motion_base_ang_vel * obs_scales.base_ang_vel,
             motion_dof_pos * obs_scales.dof_pos,
-            motion_endeffector_pos * obs_scales.body_pos,
+            motion_end_effector_pos * obs_scales.body_pos,
             ])
-        commands_buf = torch.clip(commands_buf, min=-clip_obs, max=clip_obs)
-        
-        if return_commands:
-            return commands_buf
+        self.commands_buf = torch.clip(commands_buf, min=-clip_obs, max=clip_obs)
         
         critic_commands_buf = concat([
-            motion_base_tan_norm * obs_scales.tan_norm,
+            motion_base_rotation * obs_scales.rotation,
+            motion_base_height * obs_scales.base_pos,
             motion_base_lin_vel * obs_scales.base_lin_vel,
             motion_base_ang_vel * obs_scales.base_ang_vel,
             motion_dof_pos * obs_scales.dof_pos,
@@ -463,38 +444,26 @@ class G1Imitation:
             residual_dof_pos * obs_scales.dof_pos,
             residual_body_pos * obs_scales.body_pos,
             ])
-        critic_commands_buf = torch.clip(critic_commands_buf, min=-clip_obs, max=clip_obs)
-        
-        self.commands_buf = commands_buf
-        self.critic_commands_buf = critic_commands_buf
-        
-    def compute_estimations(self):
-        clip_obs = self.cfg.observation.clip_observations
-        obs_scales = self.cfg.observation.obs_scales
-        concat = lambda xs: torch.cat([x.view(self.num_envs, -1) for x in xs], dim=-1)
-        robot_base_lin_vel = quat_rotate_inverse(self.base_quat, self.base_lin_vel)
-        
-        self.estimations_buf = concat([robot_base_lin_vel * obs_scales.base_lin_vel])
-        self.estimations_buf = torch.clip(self.estimations_buf, min=-clip_obs, max=clip_obs)
+        self.critic_commands_buf = torch.clip(critic_commands_buf, min=-clip_obs, max=clip_obs)
         
     def compute_policy_states(self):
         obs_scales = self.cfg.observation.obs_scales
         concat = lambda xs: torch.cat([x.view(self.num_envs, -1) for x in xs], dim=-1)
         
         base_height = self.base_pos[:, 2] - self.measured_heights.mean(dim=1)
-        base_tan_norm = quat_to_tan_norm(self.base_quat)
+        base_rotation = quat_to_rot6d(self.base_quat)
         dof_pos = (self.dof_pos - self.default_dof_pos)[:, self.motion_dof_indices]
         dof_vel = self.dof_vel[:, self.motion_dof_indices]
-        endeffector_pos = self.local_body_pos[:, self.endeffector_indices]
+        end_effector_pos = self.local_body_pos[:, self.end_effector_indices]
             
         return concat([
-            base_height * obs_scales.height_points,
-            base_tan_norm * obs_scales.tan_norm,
+            base_height * obs_scales.base_pos,
+            base_rotation * obs_scales.rotation,
             self.local_base_lin_vel * obs_scales.base_lin_vel, 
             self.local_base_ang_vel * obs_scales.base_ang_vel, 
             dof_pos * obs_scales.dof_pos,
             dof_vel * obs_scales.dof_vel,
-            endeffector_pos * obs_scales.body_pos,])
+            end_effector_pos * obs_scales.body_pos,])
     
     def compute_expert_states(self, motion_dict):
         assert motion_dict["base_pos"].shape[1] == 2
@@ -509,37 +478,37 @@ class G1Imitation:
         
         base_height = motion_dict["base_pos"][..., 2]
         base_quat = quat_mul(base_quat_offset[:, None], motion_dict["base_quat"])
-        base_tan_norm = quat_to_tan_norm(base_quat)
+        base_rotation = quat_to_rot6d(base_quat)
         
         base_lin_vel = quat_rotate_yaw_inverse(motion_dict["base_quat"], motion_dict["base_lin_vel"])
         base_ang_vel = quat_rotate_yaw_inverse(motion_dict["base_quat"], motion_dict["base_ang_vel"])
         
         motion_dof_indices = self.motion_dof_indices.to(device)
-        endeffector_indices = self.endeffector_indices.to(device)
+        end_effector_indices = self.end_effector_indices.to(device)
         
         dof_pos = (motion_dict["dof_pos"] - self.default_dof_pos.to(device))[..., motion_dof_indices]
         dof_vel = motion_dict["dof_vel"][..., motion_dof_indices]
         body_pos_wrt_base = motion_dict["body_pos"] - motion_dict["base_pos"][..., None, :]
         body_pos = quat_rotate_yaw_inverse(motion_dict["base_quat"][..., None, :], body_pos_wrt_base)
-        endeffector_pos = body_pos[..., endeffector_indices, :]
+        end_effector_pos = body_pos[..., end_effector_indices, :]
         
         expert_states = concat([
-            base_height[:, self.motion_pivot_id] * obs_scales.height_points,
-            base_tan_norm[:, self.motion_pivot_id] * obs_scales.tan_norm,
-            base_lin_vel[:, self.motion_pivot_id] * obs_scales.base_lin_vel, 
-            base_ang_vel[:, self.motion_pivot_id] * obs_scales.base_ang_vel, 
-            dof_pos[:, self.motion_pivot_id] * obs_scales.dof_pos,
-            dof_vel[:, self.motion_pivot_id] * obs_scales.dof_vel,
-            endeffector_pos[:, self.motion_pivot_id] * obs_scales.body_pos,])
+            base_height[:, 0] * obs_scales.base_pos,
+            base_rotation[:, 0] * obs_scales.rotation,
+            base_lin_vel[:, 0] * obs_scales.base_lin_vel, 
+            base_ang_vel[:, 0] * obs_scales.base_ang_vel, 
+            dof_pos[:, 0] * obs_scales.dof_pos,
+            dof_vel[:, 0] * obs_scales.dof_vel,
+            end_effector_pos[:, 0] * obs_scales.body_pos,])
         
         next_expert_states = concat([
-            base_height[:, 1] * obs_scales.height_points,
-            base_tan_norm[:, 1] * obs_scales.tan_norm,
+            base_height[:, 1] * obs_scales.base_pos,
+            base_rotation[:, 1] * obs_scales.rotation,
             base_lin_vel[:, 1] * obs_scales.base_lin_vel, 
             base_ang_vel[:, 1] * obs_scales.base_ang_vel, 
             dof_pos[:, 1] * obs_scales.dof_pos,
             dof_vel[:, 1] * obs_scales.dof_vel,
-            endeffector_pos[:, 1] * obs_scales.body_pos,])
+            end_effector_pos[:, 1] * obs_scales.body_pos,])
         
         assert expert_states.shape == (batch_size, self.num_states)        
         return expert_states, next_expert_states
@@ -703,7 +672,7 @@ class G1Imitation:
 
             for s in range(len(props)):
                 props[s].friction = self.friction_coeffs[env_id]
-
+                
         if self.cfg.domain_rand.randomize_restitution:
             if env_id == 0:
                 # prepare restitution randomization
@@ -714,6 +683,7 @@ class G1Imitation:
 
             for s in range(len(props)):
                 props[s].restitution = self.restitution_coeffs[env_id]
+                
         return props
 
     def _process_rigid_body_props(self, props, env_id):
@@ -730,7 +700,7 @@ class G1Imitation:
             payload_id = self.payload_indices[0]
             rng = self.cfg.domain_rand.added_payload_range
             payload_mass = np.random.uniform(rng[0] * self.total_mass, rng[1] * self.total_mass)
-            props[payload_id].mass = self.default_body_mass[payload_id] + payload_mass
+            props[payload_id].mass = np.maximum(self.default_body_mass[payload_id] + payload_mass, 1e-3)
 
         if self.cfg.domain_rand.randomize_link_mass:
             rng = self.cfg.domain_rand.link_mass_range
@@ -762,12 +732,25 @@ class G1Imitation:
         if self.cfg.domain_rand.push_robot_body:
             self._apply_push_robot_bodys()
         
-        motion_ids = self.motion_ids[:, self.motion_pivot_id]
-        pivot_motion_time = self.motion_time[:, self.motion_pivot_id]
-        self.motion_success = self.motions.check_success(motion_ids, pivot_motion_time)
-        if self.cfg.tracking_reference.resample_motion:
+        self.motion_success = self.motions.check_success(
+            self.motion_ids[:, 0],
+            self.motion_time[:, self.motion_pivot_id])
+
+        if self.cfg.tracking_reference.resample_motion and not self.test_mode:
             env_ids = self.motion_success.nonzero().flatten()
-            if len(env_ids) > 0: self._reset_motions(env_ids)
+            if len(env_ids) == 0: return
+
+            self._reset_motions(env_ids, resample_mode=True)
+            self.max_distance[env_ids] = 0.0
+            self.motion_init_length[env_ids] = self.episode_length_buf[env_ids]
+            
+    def _post_states_step_callback(self):
+        self.last_dof_vel[:] = self.dof_vel.clone()
+        self.actions[:, :-1] = self.actions[:, 1:].clone()
+        self.feet_contacts[:, :-1] = self.feet_contacts[:, 1:].clone()
+        
+        if self.viewer and self.enable_viewer_sync and self.debug_viz:
+            self._draw_debug_vis()
 
     def _compute_torques(self, actions):
         """ Compute torques from actions.
@@ -783,24 +766,35 @@ class G1Imitation:
         if control_type == "P":
             p_gains = self.p_gains * self.kp_factors
             d_gains = self.d_gains * self.kd_factors
-            action_targets = actions * self.cfg.control.action_scale + self.default_dof_pos
+            action_targets = actions * self.action_scales + self.default_dof_pos
             torques = p_gains * (action_targets - self.dof_pos) - d_gains * self.dof_vel
         else:
             raise NameError(f"Unknown controller type: {control_type}")
         
-        torques = torques + self.actuation_offset + self.joint_injection
-        return torch.clip(torques, -self.torque_limits, self.torque_limits)
+        return torques + self.actuation_offset + self.joint_injection
     
-    def _reset_motions(self, env_ids):
-        motion_ids = self.motion_ids[env_ids, self.motion_pivot_id]
-        self.motions.update_imitation_info(motion_ids, 
-            self.motion_success[env_ids], self.motion_init_time[env_ids])
+    def _reset_motions(self, env_ids, resample_mode=False):
+        pivot_motion_time=self.motion_time[env_ids, self.motion_pivot_id],
+        self.motions.update_imitation_info(
+            motion_ids=self.motion_ids[env_ids, 0],
+            init_time=self.motion_init_time[env_ids],
+            motion_time=pivot_motion_time,
+            success=self.motion_success[env_ids],
+            max_distance=self.max_distance[env_ids],
+            )
+        
+        if self.cfg.tracking_reference.randomize_motion_speed:
+            speed_rng = self.cfg.tracking_reference.motion_speed_range
+            random_timestep_sequences = self.timestep_sequences * \
+                torch_rand_float(speed_rng[0], speed_rng[1], (len(env_ids), 1), device=self.device)
+        else:
+            random_timestep_sequences = self.timestep_sequences
 
-        motion_ids = self.motions.sample_motions(len(env_ids))
+        motion_ids = self.motions.sample_motions(len(env_ids), uniform=self.test_mode)
         motion_ids = motion_ids[:, None].repeat(1, self.motion_horizon)
-        pivot_motion_ids = motion_ids[:, self.motion_pivot_id]
-        motion_init_time = self.motions.sample_init_time(pivot_motion_ids)
-        motion_time = motion_init_time[:, None]+ self.timestep_orders
+        motion_init_time = self.motions.sample_init_time(motion_ids[:, 0])
+        if self.test_mode: motion_init_time *= 0.0        
+        motion_time = motion_init_time[:, None] + random_timestep_sequences
             
         motion_dict = self.motions.get_motion_states(motion_ids, motion_time)
         for key in motion_dict.keys(): self.motion_dict[key][env_ids] = motion_dict[key]
@@ -809,9 +803,14 @@ class G1Imitation:
         self.motion_init_time[env_ids] = motion_init_time
         self.motion_time[env_ids] = motion_time + self.dt
         
-        self.base_rpy_offset[env_ids, 2] = torch_rand_float(-np.pi, np.pi, (len(env_ids),), device=self.device)
-        self.base_quat_offset[env_ids] = euler_xyz_to_quat(self.base_rpy_offset[env_ids])
-        self.base_pos_offset[env_ids, 0:2] = self.env_origins[env_ids, 0:2] + self.base_init_state[0:2]
+        if resample_mode:
+            self.base_rpy_offset[env_ids, 2] = quat_to_euler_xyz(self.base_quat[env_ids])[:, 2]
+            self.base_quat_offset[env_ids] = euler_xyz_to_quat(self.base_rpy_offset[env_ids])
+            self.base_pos_offset[env_ids, 0:2] = self.base_pos[env_ids, 0:2]
+        else:
+            self.base_rpy_offset[env_ids, 2] = torch_rand_float(-np.pi, np.pi, (len(env_ids),), device=self.device)
+            self.base_quat_offset[env_ids] = euler_xyz_to_quat(self.base_rpy_offset[env_ids])
+            self.base_pos_offset[env_ids, 0:2] = self.env_origins[env_ids, 0:2] + self.base_init_state[0:2]
                   
     def _reset_env_origins(self, env_ids):
         """ Reset environment origins.
@@ -829,6 +828,8 @@ class G1Imitation:
             env_ids (List[int]): Environemnt ids
         """        
         self.root_states[env_ids] = self.base_init_state
+        if self.motion_mode:
+            self.root_states[env_ids, 2] -= self.base_init_state[2]
         self.root_states[env_ids, 0:3] += self.env_origins[env_ids]
         self.root_states[env_ids, 0:3] += quat_rotate_yaw(
             self.base_quat_offset[env_ids], self.motion_dict["base_pos"][env_ids, self.motion_pivot_id])
@@ -836,11 +837,11 @@ class G1Imitation:
             self.base_quat_offset[env_ids], self.motion_dict["base_quat"][env_ids, self.motion_pivot_id])
         
         # [7:10]: lin vel, [10:13]: ang vel
-        self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device)
-        # self.root_states[env_ids, 7:10] = quat_rotate_yaw(
-        #     self.base_quat_offset[env_ids], self.motion_dict["base_lin_vel"][env_ids, self.motion_pivot_id])
-        # self.root_states[env_ids, 10:13] = quat_rotate_yaw(
-        #     self.base_quat_offset[env_ids], self.motion_dict["base_ang_vel"][env_ids, self.motion_pivot_id])
+        self.root_states[env_ids, 7:10] = quat_rotate_yaw(
+            self.base_quat_offset[env_ids], self.motion_dict["base_lin_vel"][env_ids, self.motion_pivot_id])
+        self.root_states[env_ids, 10:13] = quat_rotate_yaw(
+            self.base_quat_offset[env_ids], self.motion_dict["base_ang_vel"][env_ids, self.motion_pivot_id])
+        self.root_states[env_ids, 7:13] += torch_rand_float(-0.2, 0.2, (len(env_ids), 6), device=self.device)
         
         self.dof_states[env_ids, :, 0] = self.motion_dict["dof_pos"][env_ids, self.motion_pivot_id]
         self.dof_states[env_ids, :, 1] = 0.0
@@ -935,16 +936,19 @@ class G1Imitation:
         self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, -1, 13)
         self.dof_states = gymtorch.wrap_tensor(dof_state).view(self.num_envs, self.num_dof, 2)
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
-        self.feet_air_time = torch.zeros(self.num_envs, len(self.feet_contact_indices), dtype=torch.float, device=self.device)
-        self.deviation = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.deviation_time = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         
+        num_feet = len(self.feet_contact_indices)
+        self.feet_contacts = torch.zeros(self.num_envs, 2, num_feet, dtype=torch.bool, device=self.device)
+        self.feet_air_time = torch.zeros(self.num_envs, num_feet, dtype=torch.float, device=self.device)
+
+        self.deviation = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.deviation_distance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
         gravity_vec = get_axis_params(-1.0, self.up_axis_idx)
         self.gravity_vec = torch.tensor(gravity_vec, dtype=torch.float, device=self.device)
         self.gravity_vec = self.gravity_vec.repeat(self.num_envs, 1)
         self.height_points = self._init_height_points()
         
-        self.feet_contacts = torch.zeros(self.num_envs, 2, len(self.feet_contact_indices), dtype=torch.bool, device=self.device)
         self.measured_heights = torch.zeros(self.num_envs, self.num_height_points, dtype=torch.float, device=self.device)
         self.base_rpy_offset = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
         self.base_quat_offset = euler_xyz_to_quat(self.base_rpy_offset)
@@ -963,19 +967,21 @@ class G1Imitation:
         self.common_step_counter, self.extras = 0, {}
         self.actions = torch.zeros(self.num_envs, 3, self.num_dof, dtype=torch.float, device=self.device)
         self.torques = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device)
+        self.last_dof_vel = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device)
         self.p_gains = torch.zeros(self.num_dof, dtype=torch.float, device=self.device)
         self.d_gains = torch.zeros(self.num_dof, dtype=torch.float, device=self.device)
-        self.last_dof_vel = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device)
+        self.action_scales = torch.zeros(self.num_dof, dtype=torch.float, device=self.device)
         
+        self.max_distance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.reset_buf = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         self.time_out_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         
         # joint positions offsets and PD gains
-        self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device)
-        rapid_action_indices, sluggish_action_indices = [], []
-        
         zero_dof_names = []
+        action_indices = []
+        smooth_action_indices = []
+        self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device)
         for i, name in enumerate(self.dof_names):
             if name in self.cfg.init_state.default_joint_angles.keys():
                 self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
@@ -983,21 +989,32 @@ class G1Imitation:
             found = False
             for cfg_name in self.cfg.control.stiffness.keys():
                 if cfg_name in name:
-                    rapid_action_indices += [i for a in self.cfg.control.rapid_action_names if a in name]
-                    sluggish_action_indices += [i for a in self.cfg.control.sluggish_action_names if a in name]
-                    self.p_gains[i] = self.cfg.control.stiffness[cfg_name]
-                    self.d_gains[i] = self.cfg.control.damping[cfg_name]
                     found = True
+                    self.p_gains[i] = self.cfg.control.stiffness[cfg_name]
+                    self.d_gains[i] = self.p_gains[i] * self.cfg.control.default_damping_ratio
+                    self.action_scales[i] = self.cfg.control.action_scale
+                    self.action_scales[i] *= torch.abs(self.torque_limits[i] / self.p_gains[i])
+                    
+                    for act_name in self.cfg.control.action_names:
+                        if act_name in name:
+                            action_indices.append(i)
+                            break
+                        
+                    for act_name in self.cfg.control.smooth_action_names:
+                        if act_name in name:
+                            smooth_action_indices.append(i)
+                            break
+            for cfg_name in self.cfg.control.damping.keys():
+                if cfg_name in name:
+                    self.d_gains[i] = self.cfg.control.damping[cfg_name]
             if not found:
                 self.p_gains[i] = 0.0
                 self.d_gains[i] = 0.0
                 print(f"PD gains of joint {name} were not defined, setting them to zero.")
-                
-        self.rapid_action_indices = torch.tensor(list(set(rapid_action_indices)), dtype=torch.long, device=self.device)
-        self.sluggish_action_indices = torch.tensor(list(set(sluggish_action_indices)), dtype=torch.long, device=self.device)
-        self.action_indices = torch.cat([self.rapid_action_indices, self.sluggish_action_indices], dim=0)
-        self.num_actions = len(self.action_indices)
         
+        self.num_actions = len(action_indices)
+        self.action_indices = torch.tensor(action_indices, dtype=torch.long, device=self.device)
+        self.smooth_action_indices = torch.tensor(smooth_action_indices, dtype=torch.long, device=self.device)
         print(f"Setting default joint position of joint {zero_dof_names} to zero.")
         
         # randomize kp, kd, motor strength
@@ -1029,25 +1046,26 @@ class G1Imitation:
     def _init_observations(self):
         """ Initialize torch tensors which will contain observations and commands
         """
-        future_timesteps = self.cfg.env.future_timesteps
-        num_height_points = self.num_height_points if self.cfg.terrain.measure_heights else 0
-        num_joint, num_keyframe, num_endeffector = len(self.motion_dof_indices), len(self.keyframe_indices), len(self.endeffector_indices)
+        motion_horizon = self.cfg.env.motion_horizon
+        num_joint = len(self.motion_dof_indices)
+        num_keyframe = len(self.keyframe_indices)
+        num_end_effector = len(self.end_effector_indices)
         
-        self.num_obs = 3 + 3 + self.num_actions * 3 + num_height_points        
-        self.num_critic_obs = 3 + 3 + 3 + self.num_actions * 3 + num_height_points
-        self.num_commands = future_timesteps * (6 + 3 + 3 + num_joint + num_endeffector * 3)
-        self.num_critic_commands = future_timesteps * (6 + 3 + 3 + num_joint + num_keyframe * 3) + num_joint + num_keyframe * 3
+        self.num_obs = 3 + 3 + num_end_effector * 3 + self.num_actions * 3
+        self.num_critic_obs = 3 + 3 + 3 + num_end_effector * 3 + self.num_actions * 3
+        
+        one_step_command = 1 + 6 + 3 + 3 + num_joint + num_end_effector * 3
+        one_step_critic_command = 1 + 6 + 3 + 3 + num_joint + num_keyframe * 3
+        self.num_commands = motion_horizon * one_step_command
+        self.num_critic_commands = motion_horizon * one_step_critic_command + num_joint + num_keyframe * 3
         
         self.obs_buf = torch.zeros(self.num_envs, self.num_obs, dtype=torch.float, device=self.device)
         self.critic_obs_buf = torch.zeros(self.num_envs, self.num_critic_obs, dtype=torch.float, device=self.device)
         self.commands_buf = torch.zeros(self.num_envs, self.num_commands, dtype=torch.float, device=self.device)
         self.critic_commands_buf = torch.zeros(self.num_envs, self.num_critic_commands, dtype=torch.float, device=self.device)
         
-        self.num_estimations = 3 # local base lin vel
-        self.estimations_buf = torch.zeros(self.num_envs, self.num_estimations, dtype=torch.float, device=self.device)
-        
         # for discriminator
-        self.num_states = 1 + 6 + 3 + 3 + num_joint * 2 + num_endeffector * 3
+        self.num_states = 1 + 6 + 3 + 3 + num_joint * 2 + num_end_effector * 3
         self.states_buf = torch.zeros(self.num_envs, self.num_states, dtype=torch.float, device=self.device)
         self.next_states_buf = torch.zeros(self.num_envs, self.num_states, dtype=torch.float, device=self.device)
 
@@ -1055,26 +1073,43 @@ class G1Imitation:
         """ Initialize motion library and imitation schedule
         """
         self.motion_pivot_id = 0
-        self.motion_horizon = self.cfg.env.future_timesteps
+        self.motion_horizon = self.cfg.env.motion_horizon
+        self.motion_time_horizon = (self.motion_horizon - 1) * self.cfg.env.motion_dt
         
         folder_path = os.path.join(self.cfg.tracking_reference.prefix, self.cfg.tracking_reference.folder)
         mapping_path = os.path.join(folder_path, self.cfg.tracking_reference.joint_mapping)
         dataset, data_names, mapping = load_imitation_dataset(folder_path, mapping_path)
         filter_cfg = self.cfg.tracking_reference.motion_filter
-        dataset, data_names = filter_legal_motion(dataset, data_names,
-            filter_cfg.base_height_range,
-            filter_cfg.base_roll_range, filter_cfg.base_pitch_range, filter_cfg.min_time,)
+        dataset, data_names = filter_and_fix_motion(
+            dataset, data_names,
+            min_time=filter_cfg.min_time,
+            link_height_offset=filter_cfg.link_height_offset,
+            floor_height_offset=filter_cfg.floor_height_offset,
+            base_height_range=filter_cfg.base_height_range,
+            base_roll_range=filter_cfg.base_roll_range,
+            base_pitch_range=filter_cfg.base_pitch_range,
+            )
         self.motions = MotionLib(dataset, data_names, mapping, self.dof_names, self.keyframe_names, self.device)
-        self.motion_ids = self.motions.sample_motions(self.num_envs)
+        self.motion_ids = self.motions.sample_motions(self.num_envs, uniform=self.test_mode)
         self.motion_ids = self.motion_ids[:, None].repeat(1, self.motion_horizon)
         
-        self.timestep_orders = torch.linspace(0, (self.motion_horizon - 1) * self.cfg.env.future_dt, 
-                                              self.motion_horizon, dtype=torch.float, device=self.device)
-        pivot_motion_ids = self.motion_ids[:, self.motion_pivot_id]
-        self.motion_init_time = self.motions.sample_init_time(pivot_motion_ids)
-        self.motion_time = self.motion_init_time[:, None] + self.timestep_orders
+        self.timestep_sequences = torch.linspace(0, self.motion_time_horizon,
+                                                 self.motion_horizon,
+                                                 dtype=torch.float, device=self.device)
+        self.motion_init_length = self.episode_length_buf.clone()
+        
+        if self.cfg.tracking_reference.randomize_motion_speed:
+            speed_rng = self.cfg.tracking_reference.motion_speed_range
+            random_timestep_sequences = self.timestep_sequences * \
+                torch_rand_float(speed_rng[0], speed_rng[1], (self.num_envs, 1), device=self.device)
+        else:
+            random_timestep_sequences = self.timestep_sequences
+        
+        self.motion_init_time = self.motions.sample_init_time(self.motion_ids[:, 0])
+        if self.test_mode: self.motion_init_time *= 0.0
+        self.motion_time = self.motion_init_time[:, None] + random_timestep_sequences
         self.motion_dict = self.motions.get_motion_states(self.motion_ids, self.motion_time)
-        self.motion_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.motion_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)        
         self._setup_motion_state()
         
     def init_expert_dataloader(self):
@@ -1116,28 +1151,12 @@ class G1Imitation:
         self.local_body_lin_vel = quat_rotate_yaw_inverse(self.base_quat[:, None], self.body_lin_vel)
         self.local_body_ang_vel = quat_rotate_yaw_inverse(self.base_quat[:, None], self.body_ang_vel)
         
-        # decoupled local states
-        trunk_base_pos = self.body_pos[:, self.trunk_base_index]
-        mobile_base_pos = self.body_pos[:, self.mobile_base_index]
-        marker_base_pos = self.body_pos[:, self.marker_base_index]
-        
-        trunk_base_quat = self.body_quat[:, self.trunk_base_index]
-        mobile_base_quat = self.body_quat[:, self.mobile_base_index]
-        marker_base_quat = self.body_quat[:, self.marker_base_index]
-
-        self.trunk_pos = quat_rotate_inverse(trunk_base_quat, self.body_pos[:, self.trunk_indices] - trunk_base_pos)
-        self.mobile_pos = quat_rotate_inverse(mobile_base_quat, self.body_pos[:, self.mobile_indices] - mobile_base_pos)
-        self.marker_pos = quat_rotate_inverse(marker_base_quat, self.body_pos[:, self.marker_indices] - marker_base_pos)
-        
-        self.trunk_quat = quat_mul_yaw_inverse(trunk_base_quat, self.body_quat[:, self.trunk_indices])
-        self.mobile_quat = quat_mul_yaw_inverse(marker_base_quat, self.body_quat[:, self.mobile_indices])
-        self.marker_quat = quat_mul_yaw_inverse(marker_base_quat, self.body_quat[:, self.marker_indices])
-        
         self.measured_heights = self._get_heights()
         self.base_pos_offset[:, 2] = self.measured_heights.mean(dim=1)
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
-        self.feet_contacts[:, 1] = self.contact_forces[:, self.feet_contact_indices, 2] > 1.0
-        self.terminate_contacts = self.contact_forces[:, self.terminate_contact_indices, 2] > 1.0
+        
+        self.feet_contacts[:, 1] = torch.abs(self.contact_forces[:, self.feet_contact_indices, 2]) > 1.0
+        self.terminate_contacts = torch.norm(self.contact_forces[:, self.terminate_contact_indices], dim=2) > 1.0
         self.feet_first_contact = (self.feet_air_time > 0.0) & torch.any(self.feet_contacts, dim=1)
 
     def _setup_motion_state(self):
@@ -1176,23 +1195,6 @@ class G1Imitation:
         self.motion_dof_pos = self.motion_dict["dof_pos"][:, self.motion_pivot_id]
         self.motion_dof_vel = self.motion_dict["dof_vel"][:, self.motion_pivot_id]
         
-        # decoupled local states
-        motion_trunk_pos = motion_body_pos[:, self.trunk_indices] - motion_body_pos[:, self.trunk_base_index]
-        motion_mobile_pos = motion_body_pos[:, self.mobile_indices] - motion_body_pos[:, self.mobile_base_index]
-        motion_marker_pos = motion_body_pos[:, self.marker_indices] - motion_body_pos[:, self.marker_base_index]
-
-        trunk_base_quat = motion_body_quat[:, self.trunk_base_index]
-        mobile_base_quat = motion_body_quat[:, self.mobile_base_index]
-        marker_base_quat = motion_body_quat[:, self.marker_base_index]
-
-        self.motion_trunk_pos = quat_rotate_inverse(trunk_base_quat, motion_trunk_pos)
-        self.motion_mobile_pos = quat_rotate_inverse(mobile_base_quat, motion_mobile_pos)
-        self.motion_marker_pos = quat_rotate_inverse(marker_base_quat, motion_marker_pos)
-        
-        self.motion_trunk_quat = quat_mul_yaw_inverse(trunk_base_quat, motion_body_quat[:, self.trunk_indices])
-        self.motion_mobile_quat = quat_mul_yaw_inverse(marker_base_quat, motion_body_quat[:, self.mobile_indices])
-        self.motion_marker_quat = quat_mul_yaw_inverse(marker_base_quat, motion_body_quat[:, self.marker_indices])
-                
     def _prepare_rewards(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
             Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
@@ -1206,14 +1208,16 @@ class G1Imitation:
                 self.reward_scales[name] *= self.dt
         
         # prepare list of functions
-        self.tracking_sigma = {}
+        self.tracking_sigma, self.penalty_coefficient = {}, {}
         self.reward_functions, self.reward_names = [], []
         for name, scale in self.reward_scales.items():
-            if "tracking_" in name:
-                self.tracking_sigma[name] = self.cfg.rewards.init_sigma
-            
             self.reward_names.append(name)
             self.reward_functions.append(getattr(self, "_reward_" + name))
+            
+            if "tracking" in name:
+                self.tracking_sigma[name] = self.cfg.rewards.init_sigma
+            elif "penalty" in name:
+                self.penalty_coefficient[name] = self.cfg.rewards.init_coefficient
         
         # reward episode sums
         self.rew_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -1307,28 +1311,19 @@ class G1Imitation:
         self.body_link_names = [s for s in self.body_names if not s in self.keyframe_names]
         print(f"Reduced body names: {self.body_link_names}")        
         get_body_index = lambda n: self.gym.find_asset_rigid_body_index(robot_asset, n)
-        get_keyframe_index = lambda name: [i for i, key_name in enumerate(self.keyframe_names) if name in key_name]
-        
-        trunk_base_index = get_keyframe_index(self.cfg.asset.trunk_names[0])
-        mobile_base_index = get_keyframe_index(self.cfg.asset.mobile_names[0])
-        marker_base_index = get_keyframe_index(self.cfg.asset.marker_names[0])
-        
-        self.trunk_base_index = torch.tensor(trunk_base_index, dtype=torch.long, device=self.device)
-        self.mobile_base_index = torch.tensor(mobile_base_index, dtype=torch.long, device=self.device)
-        self.marker_base_index = torch.tensor(marker_base_index, dtype=torch.long, device=self.device)
 
-        mobile_indices, marker_indices, trunk_indices, endeffector_indices = [], [], [], []
+        trunk_indices, marker_indices, mobile_indices, end_effector_indices = [], [], [], []
         for i, keyframe_name in enumerate(self.keyframe_names):
             add_keyframe_index = lambda ids, names: ids + [i for name in names if name in keyframe_name]
-            trunk_indices = add_keyframe_index(trunk_indices, self.cfg.asset.trunk_names[1])
-            mobile_indices = add_keyframe_index(mobile_indices, self.cfg.asset.mobile_names[1])
-            marker_indices = add_keyframe_index(marker_indices, self.cfg.asset.marker_names[1])
-            endeffector_indices = add_keyframe_index(endeffector_indices, self.cfg.asset.endeffector_names[1])
+            trunk_indices = add_keyframe_index(trunk_indices, self.cfg.asset.trunk_names)
+            marker_indices = add_keyframe_index(marker_indices, self.cfg.asset.marker_names)
+            mobile_indices = add_keyframe_index(mobile_indices, self.cfg.asset.mobile_names)
+            end_effector_indices = add_keyframe_index(end_effector_indices, self.cfg.asset.end_effector_names)
         self.trunk_indices = torch.tensor(trunk_indices, dtype=torch.long, device=self.device)
-        self.mobile_indices = torch.tensor(mobile_indices, dtype=torch.long, device=self.device)
         self.marker_indices = torch.tensor(marker_indices, dtype=torch.long, device=self.device)
-        self.endeffector_indices = torch.tensor(endeffector_indices, dtype=torch.long, device=self.device)
-        
+        self.mobile_indices = torch.tensor(mobile_indices, dtype=torch.long, device=self.device)
+        self.end_effector_indices = torch.tensor(end_effector_indices, dtype=torch.long, device=self.device)
+
         robot_body_names = [name for name in self.body_names if not self.cfg.asset.keyframe_name in name]
         self.payload_names = [s for s in robot_body_names if self.cfg.asset.payload_name in s]
         self.payload_indices = torch.tensor([get_body_index(n) for n in self.payload_names], dtype=torch.long, device=self.device)
@@ -1344,8 +1339,8 @@ class G1Imitation:
         start_pose.p = gymapi.Vec3(*self.base_init_state[:3])
 
         self._get_env_origins()
-        env_lower = gymapi.Vec3(0., 0., 0.)
-        env_upper = gymapi.Vec3(0., 0., 0.)
+        env_lower = gymapi.Vec3(0.0, 0.0, 0.0)
+        env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
         self.envs, self.actor_handles = [], []
         for i in range(self.num_envs):
             # create env instance
@@ -1365,7 +1360,7 @@ class G1Imitation:
             self.envs.append(env_handle);self.actor_handles.append(actor_handle)
         
         self.feet_contact_names, self.feet_keyframe_names = [], []
-        for key, value in self.cfg.asset.feet_contact_binding.items():
+        for key, value in self.cfg.asset.feet_contact_names.items():
             self.feet_contact_names += [s for s in robot_body_names if value in s]
             self.feet_keyframe_names += [s for s in self.keyframe_names if key in s]
             
@@ -1378,6 +1373,7 @@ class G1Imitation:
             add_keyframe_index = lambda ids, names: ids + [i for name in names if name in keyframe_name]
             self.feet_indices = add_keyframe_index(self.feet_indices, self.feet_keyframe_names)
         self.feet_indices = torch.tensor(self.feet_indices, dtype=torch.long, device=self.device)
+        assert len(self.feet_indices) == 2, "The number of feet should be 2!!!"
 
         self.penalised_contact_names, self.terminate_contact_names = [], []
         for name in self.cfg.asset.penalised_contacts_on:
@@ -1389,14 +1385,11 @@ class G1Imitation:
         self.penalised_contact_indices = torch.tensor(penalised_contact_indices, dtype=torch.long, device=self.device)
         self.terminate_contact_indices = torch.tensor(terminate_contact_indices, dtype=torch.long, device=self.device)
 
-        upper_dof_indices, lower_dof_indices = [], []
-        for name in self.cfg.asset.upper_dof_names:
-            upper_dof_indices += [i for i, joint in enumerate(self.dof_names) if name in joint]
-        for name in self.cfg.asset.lower_dof_names:
-            lower_dof_indices += [i for i, joint in enumerate(self.dof_names) if name in joint]
-        self.upper_dof_indices = torch.tensor(list(set(upper_dof_indices)), dtype=torch.long, device=self.device)
-        self.lower_dof_indices = torch.tensor(list(set(lower_dof_indices)), dtype=torch.long, device=self.device)
-        self.motion_dof_indices = torch.cat([self.upper_dof_indices, self.lower_dof_indices,], dim=0)
+        motion_dof_indices = []
+        for name in self.cfg.asset.motion_dof_names:
+            motion_dof_indices += [i for i, joint in enumerate(self.dof_names) if name in joint]
+        motion_dof_indices = list(set(motion_dof_indices))
+        self.motion_dof_indices = torch.tensor(motion_dof_indices, dtype=torch.long, device=self.device)
         
     def _get_env_origins(self):
         """ Sets environment origins.
@@ -1422,10 +1415,10 @@ class G1Imitation:
 
     def _parse_cfg(self):
         self.dt = self.cfg.control.decimation * self.sim_params.dt
-        self.reward_scales = self.cfg.rewards.scales
+        self.reward_scales = class_to_dict(self.cfg.rewards.scales)
         if self.cfg.terrain.mesh_type not in ["heightfield", "trimesh"]:
             self.cfg.terrain.curriculum = False
-        self.max_episode_length = np.ceil(self.cfg.env.max_episode_length_sec / self.dt)
+        self.max_episode_length = np.ceil(np.array(self.cfg.env.max_episode_length_sec) / self.dt)
         self.push_robot_base_interval = np.ceil(np.array(self.cfg.domain_rand.push_robot_base_interval_sec) / self.dt)
         self.push_robot_body_duration = np.ceil(np.array(self.cfg.domain_rand.push_robot_body_duration_sec) / self.dt)
         self.push_robot_body_interval = np.ceil(np.array(self.cfg.domain_rand.push_robot_body_interval_sec) / self.dt)
@@ -1436,32 +1429,11 @@ class G1Imitation:
             Default behaviour: draws target body position and orientation
         """
         self.gym.clear_lines(self.viewer)
-        terrain_sphere = WireframeSphereGeometry(0.02, 8, 8, None, color=(1, 1, 0))
-        keyframe_sphere = WireframeSphereGeometry(0.03, 8, 8, None, color=(0, 1, 1))
-        marker_sphere = WireframeSphereGeometry(0.08, 8, 8, None, color=(1, 0, 1))
-        
-        motion_local_body_pos = quat_rotate_yaw(
-            self.base_quat[:, None], self.motion_local_body_pos) + self.base_pos[:, None]
-        motion_marker_pos = quat_rotate(self.body_quat[:, self.marker_base_index], self.motion_marker_pos)
-        motion_marker_pos += self.body_pos[:, self.marker_base_index]
-        
+        keyframe_sphere = WireframeSphereGeometry(0.03, 16, 16, None, color=(0, 1, 1))
+                
+        motion_local_body_pos = quat_rotate_yaw(self.base_quat[:, None], self.motion_local_body_pos)
+        motion_local_body_pos += self.base_pos[:, None]
         for i in range(self.num_envs):
-            base_pos = self.base_pos[i].cpu().numpy()
-            heights = self.measured_heights[i].cpu().numpy()
-            height_points = quat_rotate_yaw(self.base_quat[i:i+1], self.height_points[i]).cpu().numpy()
-            for j in range(heights.shape[0]):
-                x = height_points[j, 0] + base_pos[0]
-                y = height_points[j, 1] + base_pos[1]
-                z = heights[j]
-                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(terrain_sphere, self.gym, self.viewer, self.envs[i], sphere_pose)
-            
-            motion_body_pos = motion_marker_pos[i].cpu().numpy()
-            for j in range(len(self.marker_indices)):
-                x, y, z = motion_body_pos[j, 0], motion_body_pos[j, 1], motion_body_pos[j, 2]
-                target_sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(marker_sphere, self.gym, self.viewer, self.envs[i], target_sphere_pose)
-            
             motion_body_pos = motion_local_body_pos[i].cpu().numpy()
             for j in range(len(self.keyframe_indices)):
                 x, y, z = motion_body_pos[j, 0], motion_body_pos[j, 1], motion_body_pos[j, 2]
@@ -1523,80 +1495,115 @@ class G1Imitation:
         return heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
 
     #------------ reward functions----------------
-    def _reward_tracking_keyframe_pos(self):
-        diff_body_pos = self.motion_local_body_pos - self.local_body_pos
-        diff_body_dist = torch.norm(diff_body_pos, dim=2)
-        mean_diff_body_dist = torch.norm(diff_body_dist, dim=1)
-        coefficient = -1.0 / self.tracking_sigma["tracking_keyframe_pos"]
-        reward = torch.exp(coefficient * mean_diff_body_dist)
-        return reward, mean_diff_body_dist
+    def _reward_tracking_joint_pos(self):
+        diff_dof_pos = (self.dof_pos - self.motion_dof_pos)[:, self.motion_dof_indices]
+        diff_dof_pos = torch.norm(diff_dof_pos, dim=1)
+        coefficient = -1.0 / self.tracking_sigma["tracking_joint_pos"]
+        reward = torch.exp(coefficient * diff_dof_pos)
+        return reward, diff_dof_pos
+
+    def _reward_tracking_joint_vel(self):
+        diff_dof_vel = (self.dof_vel - self.motion_dof_vel)[:, self.motion_dof_indices]
+        diff_dof_vel = torch.norm(diff_dof_vel, dim=1)
+        coefficient = -1.0 / self.tracking_sigma["tracking_joint_vel"]
+        reward = torch.exp(coefficient * diff_dof_vel)
+        return reward, diff_dof_vel
+
+    def _reward_tracking_trunk_lin_vel(self):
+        diff_body_lin_vel = self.local_body_lin_vel - self.motion_local_body_lin_vel
+        diff_trunk_lin_vel = diff_body_lin_vel[:, self.trunk_indices]
+        diff_trunk_lin_vel = torch.norm(diff_trunk_lin_vel, dim=(1, 2))
+        coefficient = -1.0 / self.tracking_sigma["tracking_trunk_lin_vel"]
+        reward = torch.exp(coefficient * diff_trunk_lin_vel)
+        return reward, diff_trunk_lin_vel
+
+    def _reward_tracking_trunk_ang_vel(self):
+        diff_body_ang_vel = self.local_body_ang_vel - self.motion_local_body_ang_vel
+        diff_trunk_ang_vel = diff_body_ang_vel[:, self.trunk_indices]
+        diff_trunk_ang_vel = torch.norm(diff_trunk_ang_vel, dim=(1, 2))
+        coefficient = -1.0 / self.tracking_sigma["tracking_trunk_ang_vel"]
+        reward = torch.exp(coefficient * diff_trunk_ang_vel)
+        return reward, diff_trunk_ang_vel
+    
+    def _reward_tracking_trunk_vel_dir(self):
+        robot_trunk_lin_vel = self.local_body_lin_vel[:, self.trunk_indices]
+        robot_trunk_ang_vel = self.local_body_ang_vel[:, self.trunk_indices]
+
+        motion_trunk_lin_vel = self.motion_local_body_lin_vel[:, self.trunk_indices]
+        motion_trunk_ang_vel = self.motion_local_body_ang_vel[:, self.trunk_indices]
+        
+        robot_trunk_vel_dir = torch.cat([
+            F.normalize(robot_trunk_lin_vel, dim=2),
+            F.normalize(robot_trunk_ang_vel, dim=2),
+            ], dim=2)
+        motion_trunk_vel_dir = torch.cat([
+            F.normalize(motion_trunk_lin_vel, dim=2),
+            F.normalize(motion_trunk_ang_vel, dim=2),
+            ], dim=2)
+        diff_vel_direction = torch.norm(1.0 - F.cosine_similarity(
+            robot_trunk_vel_dir, motion_trunk_vel_dir, dim=2), dim=1)
+        coefficient = -1.0 / self.tracking_sigma["tracking_trunk_vel_dir"]
+        reward = torch.exp(coefficient * diff_vel_direction)
+        return reward, diff_vel_direction
 
     def _reward_tracking_marker_pos(self):
-        diff_marker_dist = torch.norm(self.motion_marker_pos - self.marker_pos, dim=2)
-        mean_diff_marker_dist = torch.norm(diff_marker_dist, dim=1)
+        diff_local_body_pos = self.local_body_pos - self.motion_local_body_pos
+        diff_marker_pos = diff_local_body_pos[:, self.marker_indices]
+        diff_marker_dist = torch.norm(diff_marker_pos, dim=(1, 2))
         coefficient = -1.0 / self.tracking_sigma["tracking_marker_pos"]
-        reward = torch.exp(coefficient * mean_diff_marker_dist)
-        return reward, mean_diff_marker_dist
-
-    def _reward_tracking_mobile_pos(self):
-        diff_mobile_dist = torch.norm(self.motion_mobile_pos - self.mobile_pos, dim=2)
-        mean_diff_mobile_dist = torch.norm(diff_mobile_dist, dim=1)
-        coefficient = -1.0 / self.tracking_sigma["tracking_mobile_pos"]
-        reward = torch.exp(coefficient * mean_diff_mobile_dist)
-        return reward, mean_diff_mobile_dist
-
-    def _reward_tracking_feet_pos(self):
-        diff_body_pos = self.motion_local_body_pos - self.local_body_pos
-        mean_diff_feet_dist = torch.norm(diff_body_pos[:, self.feet_indices], dim=(1, 2))
-        coefficient = -1.0 / self.tracking_sigma["tracking_feet_pos"]
-        reward = torch.exp(coefficient * mean_diff_feet_dist)
-        return reward, mean_diff_feet_dist
-
-    def _reward_tracking_joint_pos(self):
-        diff_dof_pos = self.dof_pos - self.motion_dof_pos
-        diff_motion_dof_pos = torch.abs(diff_dof_pos[:, self.motion_dof_indices])
-        diff_joint_angle = torch.sum(diff_motion_dof_pos, dim=1)
-        coefficient = -1.0 / self.tracking_sigma["tracking_joint_pos"]
-        reward = torch.exp(coefficient * diff_joint_angle)
-        return reward, diff_joint_angle
-
-    def _reward_tracking_trunk_orin(self):
-        diff_trunk_quat = quat_mul_inverse(self.trunk_quat, self.motion_trunk_quat)
-        diff_trunk_orin = torch.abs(quat_to_angle_axis(diff_trunk_quat)[0])
-        mean_diff_trunk_orin = torch.sum(diff_trunk_orin, dim=1)
-        coefficient = -1.0 / self.tracking_sigma["tracking_trunk_orin"]
-        reward = torch.exp(coefficient * mean_diff_trunk_orin)
-        return reward, mean_diff_trunk_orin
+        reward = torch.exp(coefficient * diff_marker_dist)
+        return reward, diff_marker_dist
     
-    def _reward_tracking_base_lin_vel(self):
-        diff_base_lin_vel = torch.norm(self.motion_local_base_lin_vel - self.local_base_lin_vel, dim=1)
-        coefficient = -1.0 / self.tracking_sigma["tracking_base_lin_vel"]
-        reward = torch.exp(coefficient * diff_base_lin_vel)
-        return reward, diff_base_lin_vel
-    
-    def _reward_tracking_base_ang_vel(self):
-        diff_base_ang_vel = self.motion_local_base_ang_vel - self.local_base_ang_vel
-        diff_base_ang_vel = torch.abs(diff_base_ang_vel[..., 2])
-        coefficient = -1.0 / self.tracking_sigma["tracking_base_ang_vel"]
-        reward = torch.exp(coefficient * diff_base_ang_vel)
-        return reward, diff_base_ang_vel
+    def _reward_tracking_feet_height(self):
+        diff_local_body_pos = self.motion_local_body_pos - self.local_body_pos
+        diff_feet_height = diff_local_body_pos[:, self.feet_indices, 2]
+        diff_feet_height = torch.norm(torch.where(
+            torch.any(self.feet_contacts, dim=1),
+            diff_feet_height,
+            diff_feet_height + self.cfg.rewards.feet_height_target), dim=1)
+        coefficient = -1.0 / self.tracking_sigma["tracking_feet_height"]
+        reward = torch.exp(coefficient * diff_feet_height)
+        return reward, diff_feet_height
 
-    def _reward_tracking_base_lin_dir(self):
-        robot_base_vel_norm = torch.norm(self.local_base_lin_vel, dim=1)
-        motion_base_vel_norm = torch.norm(self.motion_local_base_lin_vel, dim=1)
-        clipped_motion_vel_norm = torch.clip(motion_base_vel_norm - 0.2, min=0.0)
-        diff_vel_direction = F.cosine_similarity(
-            self.local_base_lin_vel, self.motion_local_base_lin_vel, dim=1)
-        diff_base_lin_dir = torch.abs(torch.where(
-            robot_base_vel_norm * clipped_motion_vel_norm > 0.0, 
-            1.0 - diff_vel_direction, clipped_motion_vel_norm - robot_base_vel_norm))
-        coefficient = -1.0 / self.tracking_sigma["tracking_base_lin_dir"]
-        reward = torch.exp(coefficient * diff_base_lin_dir)
-        return reward, diff_base_lin_dir
+    def _reward_tracking_keyframe_height(self):
+        diff_body_pos = self.body_pos - self.motion_body_pos
+        diff_keyframe_height = diff_body_pos[:, self.end_effector_indices, 2]
+        diff_keyframe_height = torch.amax(torch.abs(diff_keyframe_height), dim=1)
+        coefficient = -1.0 / self.tracking_sigma["tracking_keyframe_height"]
+        reward = torch.exp(coefficient * diff_keyframe_height)
+        return reward, diff_keyframe_height
+
+    def _reward_penalty_action_rates(self):
+        actions = self.actions[..., self.action_indices]
+        action_rates = torch.norm(actions[:, 2] - actions[:, 1], dim=1)
+        coefficient = self.penalty_coefficient["penalty_action_rates"]
+        return action_rates / coefficient, action_rates
+    
+    def _reward_penalty_action_smoothness(self):
+        actions = self.actions[..., self.smooth_action_indices]
+        action_smoothness = torch.norm(
+            actions[:, 2] - 2.0 * actions[:, 1] + actions[:, 0], dim=1)
+        coefficient = self.penalty_coefficient["penalty_action_smoothness"]
+        return action_smoothness / coefficient, action_smoothness
+    
+    def _reward_penalty_torques(self):
+        soft_limits = self.torque_limits * self.cfg.rewards.soft_torques_limit
+        torques = (self.torques / soft_limits)[:, self.action_indices]
+        torques = torch.norm(torques, dim=1)
+        coefficient = self.penalty_coefficient["penalty_torques"]
+        return torques / coefficient, torques
+
+    def _reward_penalty_dof_acc(self):
+        dof_acc = (self.dof_vel - self.last_dof_vel)[:, self.action_indices]
+        dof_acc = torch.norm(dof_acc, dim=1)
+        coefficient = self.penalty_coefficient["penalty_dof_acc"]
+        return dof_acc / coefficient, dof_acc
 
     def _reward_feet_slippage(self):
-        feet_lin_vel_xy = torch.norm(self.rigid_body_states[:, self.feet_contact_indices, 7:9], dim=2)
-        feet_slippage = torch.sum(feet_lin_vel_xy * torch.any(self.feet_contacts, dim=1).float(), dim=1)
+        feet_lin_vel_xy = self.rigid_body_states[:, self.feet_contact_indices, 7:9]
+        feet_lin_vel_xy = torch.norm(feet_lin_vel_xy, dim=2)
+        feet_contact_masks = torch.any(self.feet_contacts, dim=1).float()
+        feet_slippage = torch.sum(feet_lin_vel_xy * feet_contact_masks, dim=1)
         return feet_slippage, feet_slippage
     
     def _reward_feet_stumble(self):
@@ -1606,47 +1613,22 @@ class G1Imitation:
         return feet_stumble, feet_stumble
 
     def _reward_feet_air_time(self):
-        first_contact = self.feet_first_contact.float()
-        air_time = self.feet_air_time - self.cfg.rewards.feet_air_time_limit
-        air_time = torch.clip(air_time, max=0.0)
-        feet_air_time = torch.sum(air_time * first_contact, dim=1)
+        air_time_target = self.cfg.rewards.feet_air_time_target
+        feet_air_time = torch.clip(1.0 - self.feet_air_time / air_time_target, min=0.0)
+        feet_air_time = torch.sum(torch.where(self.feet_first_contact, feet_air_time, 0.0), dim=1)
+        feet_on_fly = torch.all(~self.feet_contacts, dim=1)
+        self.feet_air_time = torch.where(feet_on_fly, self.feet_air_time, 0.0)
         return feet_air_time, feet_air_time
     
-    def _reward_joint_errors(self):
-        dof_error = self.dof_pos - self.default_dof_pos
-        dof_error = torch.sum(torch.square(dof_error[:, self.lower_dof_indices]), dim=1)
-        return dof_error, dof_error
- 
-    def _reward_joint_accelerations(self):
-        dof_acceleration = (self.dof_vel - self.last_dof_vel) / self.dt
-        dof_acceleration = torch.sum(torch.square(dof_acceleration), dim=1)
-        return dof_acceleration, dof_acceleration
-    
-    def _reward_rapid_torques(self):
-        torques = self.torques[:, self.rapid_action_indices]
-        torques = torch.sum(torch.square(torques), dim=1)
-        return torques, torques
+    def _reward_feet_distance(self):
+        xy_dist_target = self.cfg.rewards.feet_xy_dist_target
+        feet_pos = self.local_body_pos[:, self.feet_indices]
+        feet_distance = torch.norm(feet_pos[:, 0] - feet_pos[:, 1], dim=1)
+        feet_distance = torch.clip(1.0 - feet_distance / xy_dist_target, min=0.0)
+        return feet_distance, feet_distance
 
-    def _reward_sluggish_torques(self):
-        torques = self.torques[:, self.sluggish_action_indices]
-        torques = torch.sum(torch.square(torques), dim=1)
-        return torques, torques
-
-    def _reward_rapid_action_rates(self):
-        actions = self.actions[..., self.rapid_action_indices]
-        action_rate = torch.sum(torch.square(actions[:, 2] - actions[:, 1]), dim=1)
-        action_smoothness = torch.sum(torch.square(
-            actions[:, 2] - 2 * actions[:, 1] + actions[:, 0]), dim=1)
-        total_action_rate = action_rate + 0.2 * action_smoothness
-        return total_action_rate, total_action_rate
-
-    def _reward_sluggish_action_rates(self):
-        actions = self.actions[..., self.sluggish_action_indices]
-        action_rate = torch.sum(torch.square(actions[:, 2] - actions[:, 1]), dim=1)
-        action_smoothness = torch.sum(torch.square(
-            actions[:, 2] - 2 * actions[:, 1] + actions[:, 0]), dim=1)
-        total_action_rate = action_rate + 0.2 * action_smoothness
-        return total_action_rate, total_action_rate
+    def _reward_deviation(self):
+        return self.deviation_distance, self.deviation_distance
 
     def _reward_alive(self):
         alive = 1.0 - (self.reset_buf | self.deviation).float()
@@ -1664,8 +1646,17 @@ class G1Imitation:
     def _reward_action_limits(self):
         out_of_lower_limits = (self.dof_pos <= self.dof_pos_limits[:, 0]).float()
         out_of_upper_limits = (self.dof_pos >= self.dof_pos_limits[:, 1]).float()
-        out_of_limits = torch.clip(-1.0 * out_of_lower_limits * self.torques, min=0.0)
-        out_of_limits += torch.clip(1.0 * out_of_upper_limits * self.torques, min=0.0)
+        soft_limits = self.torque_limits * self.cfg.rewards.soft_torques_limit
+        torques = self.torques / soft_limits
+        out_of_limits = torch.clip(-1.0 * out_of_lower_limits * torques, min=0.0)
+        out_of_limits += torch.clip(1.0 * out_of_upper_limits * torques, min=0.0)
+        out_of_limits = torch.sum(out_of_limits[:, self.action_indices], dim=1)
+        return out_of_limits, out_of_limits
+
+    def _reward_torque_limits(self):
+        soft_limits = self.torque_limits * self.cfg.rewards.soft_torques_limit
+        out_of_limits = torch.clip(torch.abs(self.torques) - soft_limits, min=0.0)
+        out_of_limits = out_of_limits / soft_limits    
         out_of_limits = torch.sum(out_of_limits[:, self.action_indices], dim=1)
         return out_of_limits, out_of_limits
 
@@ -1676,13 +1667,7 @@ class G1Imitation:
         return out_of_limits, out_of_limits
 
     def _reward_dof_vel_limits(self):
-        limits = self.dof_vel_limits * self.cfg.rewards.soft_dof_vel_limit
-        out_of_limits = torch.clip(torch.abs(self.dof_vel) - limits, min=0.0)
-        out_of_limits = torch.sum(out_of_limits[:, self.action_indices], dim=1)
-        return out_of_limits, out_of_limits
-
-    def _reward_torque_limits(self):
-        limits = self.torque_limits * self.cfg.rewards.soft_torque_limit
-        out_of_limits = torch.clip(torch.abs(self.torques) - limits, min=0.0)
+        soft_limits = self.dof_vel_limits * self.cfg.rewards.soft_dof_vel_limit
+        out_of_limits = torch.clip(torch.abs(self.dof_vel) - soft_limits, min=0.0)
         out_of_limits = torch.sum(out_of_limits[:, self.action_indices], dim=1)
         return out_of_limits, out_of_limits

@@ -15,10 +15,17 @@ from tqdm import tqdm
 from typing import Union
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, PPO_DISC, PPO_LATENT, HIMPPO
+from rsl_rl.algorithms import PPO, PPO_DISC
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import Discriminator, Container, LatentContainer
-from rsl_rl.modules import ActorCritic, ActorCriticLatent, ActorCriticRecurrent
+from rsl_rl.modules import (
+    Discriminator, 
+    Container, 
+    RecurrentContainer, 
+    )
+from rsl_rl.modules import (
+    ActorCritic, 
+    ActorCriticRecurrent, 
+    )
 from rsl_rl.utils import store_code_state
 
 
@@ -28,6 +35,7 @@ class OnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.alg_cfg = train_cfg["algorithm"]
         self.runner_cfg = train_cfg["runner"]
+        self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
         
@@ -39,13 +47,15 @@ class OnPolicyRunner:
         policy_class_name = self.runner_cfg["policy_class_name"]
         alg_class_name = self.runner_cfg["algorithm_class_name"]
         
-        actor_critic: Union[ActorCritic, ActorCriticLatent, ActorCriticRecurrent] = \
+        actor_critic: Union[ActorCritic, ActorCriticRecurrent] = \
             eval(policy_class_name)(
             self.env.num_obs, 
             self.env.num_critic_obs,
             self.env.num_commands,
             self.env.num_critic_commands,
-            self.env.num_actions, **train_cfg["policy"]).to(self.device)
+            self.env.num_actions,
+            **self.policy_cfg,
+            ).to(self.device)
             
         if alg_class_name == "PPO":
             self.alg: PPO = eval(alg_class_name)(
@@ -53,18 +63,6 @@ class OnPolicyRunner:
             self.alg.init_storage(
                 num_envs=self.env.num_envs,
                 num_transitions=self.num_steps_per_env, 
-                obs_shape=[self.env.num_obs], 
-                critic_obs_shape=[self.env.num_critic_obs],
-                command_shape=[self.env.num_commands],
-                critic_command_shape=[self.env.num_critic_commands],
-                actions_shape=[self.env.num_actions],
-                )
-        elif alg_class_name == "PPO_LATENT":
-            self.alg: PPO_LATENT = eval(alg_class_name)(
-                actor_critic, device=self.device, **self.alg_cfg)
-            self.alg.init_storage(
-                num_envs=self.env.num_envs,
-                num_transitions=self.num_steps_per_env,
                 obs_shape=[self.env.num_obs], 
                 critic_obs_shape=[self.env.num_critic_obs],
                 command_shape=[self.env.num_commands],
@@ -88,13 +86,7 @@ class OnPolicyRunner:
         else:
             raise ValueError(f"Invalid algorithm class name: {alg_class_name}")
         
-        if alg_class_name == "PPO_LATENT":
-            self.alg.load_extra_components(
-                self.env.sample_overlap_commands,
-                self.env.sample_random_commands,
-                self.env.compute_dtw_distances,
-                ) 
-        elif alg_class_name == "PPO_DISC":
+        if alg_class_name == "PPO_DISC":
             self.alg.load_extra_components(self.env.init_expert_dataloader())
             
         # Log
@@ -204,17 +196,14 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs, critic_commands)
             
-            total_completion, total_success_rate = self.env.get_task_info()
+            task_info_dict = self.env.get_task_info()
             mean_noise_std, mean_action_rate, mean_action_smoothness = self.alg.storage.get_statistics()
             
             if isinstance(self.alg, PPO):
-                mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_kl_divergence = self.alg.update()
-            elif isinstance(self.alg, PPO_LATENT):
-                mean_value_loss, mean_surrogate_loss, mean_estimator_loss, \
-                    mean_kl_divergence, mean_overlap_loss, mean_triplet_loss = self.alg.update()
+                mean_value_loss, mean_surrogate_loss, mean_kl_divergence = self.alg.update()
             elif isinstance(self.alg, PPO_DISC):
-                mean_value_loss, mean_surrogate_loss, mean_estimator_loss, \
-                    mean_kl_divergence, mean_discriminator_loss, mean_prediction = self.alg.update()    
+                mean_value_loss, mean_surrogate_loss, mean_kl_divergence, \
+                    mean_discriminator_loss, mean_prediction = self.alg.update()    
             else:
                 raise NotImplementedError
             
@@ -287,14 +276,10 @@ class OnPolicyRunner:
         if self.env.headless:
             self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
             self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
-            self.writer.add_scalar("Loss/estimation", locs["mean_estimator_loss"], locs["it"])
             self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
             self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
             
-            if isinstance(self.alg, PPO_LATENT):
-                self.writer.add_scalar("Loss/overlaps", locs["mean_overlap_loss"], locs["it"])
-                self.writer.add_scalar("Loss/triplets", locs["mean_triplet_loss"], locs["it"])
-            elif isinstance(self.alg, PPO_DISC):
+            if isinstance(self.alg, PPO_DISC):
                 self.writer.add_scalar("Loss/discriminator_loss", locs["mean_discriminator_loss"], locs["it"])
                 self.writer.add_scalar("Loss/mean_prediction", locs["mean_prediction"], locs["it"])
             
@@ -310,8 +295,8 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
                 self.writer.add_scalar("Train/mean_completion", statistics.mean(locs["combuffer"]), locs["it"])
                 self.writer.add_scalar("Train/mean_successful_rate", statistics.mean(locs["sucbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/total_completion", locs["total_completion"], locs["it"])
-            self.writer.add_scalar("Train/total_success_rate", locs["total_success_rate"], locs["it"])
+            for key, value in locs["task_info_dict"].items():
+                self.writer.add_scalar(f"Train/{key}", value, locs["it"])
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs["lenbuffer"]) > 0:
@@ -372,8 +357,8 @@ class OnPolicyRunner:
             self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-        self.current_learning_iteration = loaded_dict["iter"]
-
+        self.current_learning_iteration = 0 # loaded_dict["iter"]
+        
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
         if device is not None:
@@ -382,14 +367,14 @@ class OnPolicyRunner:
         return policy
 
     def export_model(self):
-        self.eval_mode()        
-        if isinstance(self.alg, (PPO, PPO_DISC)):
-            actor_critic = Container(copy.deepcopy(self.alg.actor_critic).to("cpu"))
-        elif isinstance(self.alg, PPO_LATENT):
-            actor_critic = LatentContainer(copy.deepcopy(self.alg.actor_critic).to("cpu"))
+        self.eval_mode()
+        actor_critic_copy = copy.deepcopy(self.alg.actor_critic).to("cpu")
+        if isinstance(self.alg.actor_critic, ActorCriticRecurrent):
+            actor_critic = RecurrentContainer(actor_critic_copy, self.env.num_envs)
+        elif isinstance(self.alg.actor_critic, ActorCritic):
+            actor_critic = Container(actor_critic_copy, self.env.num_envs)
         else:
             raise NotImplementedError
-        
         return actor_critic
 
     def train_mode(self):

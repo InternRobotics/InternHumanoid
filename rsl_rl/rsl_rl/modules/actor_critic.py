@@ -30,8 +30,8 @@ class ActorCritic(nn.Module):
         num_actions,
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
-        init_std=-1.0,
-        const_noise=False,
+        init_std=1.0,
+        noise_mode="constant",
         **kwargs,
     ):
         if kwargs:
@@ -45,8 +45,20 @@ class ActorCritic(nn.Module):
         mlp_input_dim_c = num_critic_obs + num_critic_commands
         
         self.init_std = init_std
-        self.const_noise = const_noise
+        self.noise_mode = noise_mode
         
+        # Action noise
+        zero_actions = torch.zeros(num_actions)
+        if self.noise_mode == "constant":
+            self.register_buffer("std", init_std + zero_actions)
+        elif self.noise_mode == "learnable":
+            self.std = nn.Parameter(init_std + zero_actions)
+        elif self.noise_mode == "policy":
+            self.std = None
+            num_actions *= 2   # mean and std
+        else:
+            raise ValueError(f"Invalid noise mode: {self.noise_mode}")
+
         # Normalizer
         self.normalizers = nn.ModuleDict({
             "actor": Normalization(shape=[num_actor_obs]),
@@ -75,8 +87,8 @@ class ActorCritic(nn.Module):
                     alpha_init=1.0 / num_blocks,
                     alpha_scale=1.0 / dimensions,
                     )]
-        actor_layers.append(HyperPolicyHead(actor_hidden_dim, num_actions))
         self.actor = nn.Sequential(*actor_layers)
+        self.actor_head = HyperPolicyHead(actor_hidden_dim, num_actions)
 
         # Value function
         num_blocks = len(critic_hidden_dims)
@@ -103,16 +115,13 @@ class ActorCritic(nn.Module):
         
         self.distribution = None
         
-        # Action noise
-        if self.const_noise:
-            self.register_buffer("std", init_std + torch.zeros(num_actions))
-        else:
-            self.std = nn.Parameter(init_std + torch.zeros(num_actions))
-        
         # disable args validation for speedup
         Normal.set_default_validate_args = False
 
     def reset(self, dones=None):
+        return
+    
+    def get_hidden_states(self):
         return
 
     def forward(self):
@@ -131,8 +140,15 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, concate_observations):
-        mean = self.actor(concate_observations)
-        std = torch.abs(self.std.expand_as(mean))
+        outputs = self.actor(concate_observations)
+        if self.noise_mode == "policy":
+            outputs = self.actor_head(outputs)
+            mean, log_std = torch.chunk(outputs, 2, dim=-1)
+            std = torch.clip(log_std, min=-5.0, max=1.0).exp()
+        else:
+            mean = self.actor_head(outputs)
+            std = torch.abs(self.std.expand_as(mean))
+            std = torch.clip(std, min=1e-3)
         self.distribution = Normal(mean, std)
         
     def act(self, observations, commands, **kwargs):
@@ -143,22 +159,25 @@ class ActorCritic(nn.Module):
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
-        return self.distribution.log_prob(actions).sum(dim=-1)
+        return torch.sum(self.distribution.log_prob(actions), dim=-1)
 
     def act_inference(self, observations, commands, **kwargs):
         observations = self.normalizers["actor"](observations)
         commands = self.normalizers["command"](commands)
         concate_observations = torch.cat([observations, commands], dim=-1)
-        return self.actor(concate_observations), None
+        outputs = self.actor_head(self.actor(concate_observations))
+        
+        if self.noise_mode == "policy":
+            action_mean = torch.chunk(outputs, 2, dim=-1)[0]
+        else:
+            action_mean = outputs
+        return action_mean, None
 
     def evaluate(self, critic_observations, critic_commands, **kwargs):
         observations = self.normalizers["critic"](critic_observations)
         commands = self.normalizers["critic_command"](critic_commands)
         concate_observations = torch.cat([observations, commands], dim=-1)
         return self.critic_head(self.critic(concate_observations))
-    
-    def get_hidden_states(self):
-        return
         
     
 def get_activation(act_name):

@@ -11,16 +11,16 @@ class RolloutStorage:
         def __init__(self):
             self.observations = None
             self.critic_observations = None
-            self.next_observations = None
-            self.next_critic_observations = None
-            
             self.commands = None
             self.critic_commands = None
+            
+            self.next_observations = None
+            self.next_critic_observations = None
             self.next_commands = None
             self.next_critic_commands = None
             
+            self.prior_states = None
             self.hidden_states = None
-            self.prior_hidden_states = None
             
             self.actions = None
             self.rewards = None
@@ -73,7 +73,7 @@ class RolloutStorage:
         
         # For RNN Estimator
         self.saved_hidden_states_p = None
-           
+        
         self.step = 0
         self.device = device
         self.num_envs = num_envs
@@ -83,14 +83,15 @@ class RolloutStorage:
         if self.step >= self.num_transitions:
             raise AssertionError("Rollout buffer overflow")
         self.observations[self.step].copy_(transition.observations)
-        self.critic_observations[self.step].copy_(transition.critic_observations)
-        self.next_observations[self.step].copy_(transition.next_observations)
-        self.next_critic_observations[self.step].copy_(transition.next_critic_observations)
-        
+        self.critic_observations[self.step].copy_(transition.critic_observations)        
         self.commands[self.step].copy_(transition.commands)
         self.critic_commands[self.step].copy_(transition.critic_commands)
-        self.next_commands[self.step].copy_(transition.next_commands)
-        self.next_critic_commands[self.step].copy_(transition.next_critic_commands)
+
+        if isinstance(transition.next_observations, torch.Tensor):
+            self.next_observations[self.step].copy_(transition.next_observations)
+            self.next_critic_observations[self.step].copy_(transition.next_critic_observations)
+            self.next_commands[self.step].copy_(transition.next_commands)
+            self.next_critic_commands[self.step].copy_(transition.next_critic_commands)
 
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
@@ -101,8 +102,8 @@ class RolloutStorage:
         self.sigma[self.step].copy_(transition.action_sigma)
         
         # For RNN networks
+        self._save_prior_states(transition.prior_states)
         self._save_hidden_states(transition.hidden_states)
-        self._save_prior_hidden_states(transition.prior_hidden_states)
         
         # Increment the counter
         self.step += 1
@@ -124,17 +125,17 @@ class RolloutStorage:
             self.saved_hidden_states_a[i][self.step].copy_(hid_a)
             self.saved_hidden_states_c[i][self.step].copy_(hid_c)
 
-    def _save_prior_hidden_states(self, hidden_states):
+    def _save_prior_states(self, hidden_states):
         if hidden_states is None: return
-        hidden_e = hidden_states if isinstance(hidden_states, tuple) else (hidden_states,)
+        hidden_p = hidden_states if isinstance(hidden_states, tuple) else (hidden_states,)
         # initialize if needed
         if self.saved_hidden_states_p is None:
             self.saved_hidden_states_p = [
-                torch.zeros(self.num_transitions, *hid.shape, dtype=torch.float, device=self.device) for hid in hidden_e
+                torch.zeros(self.num_transitions, *hid.shape, dtype=torch.float, device=self.device) for hid in hidden_p
             ]
         # copy the states
-        for i, hid_e in enumerate(hidden_e):
-            self.saved_hidden_states_p[i][self.step].copy_(hid_e)
+        for i, hid_p in enumerate(hidden_p):
+            self.saved_hidden_states_p[i][self.step].copy_(hid_p)
 
     def clear(self):
         self.step = 0
@@ -170,20 +171,20 @@ class RolloutStorage:
         
         observations = self.observations.flatten(0, 1)
         critic_observations = self.critic_observations.flatten(0, 1)
+        commands = self.commands.flatten(0, 1)
+        critic_commands = self.critic_commands.flatten(0, 1)
+        
         next_observations = self.next_observations.flatten(0, 1)
         next_critic_observations = self.next_critic_observations.flatten(0, 1)
+        next_commands = self.next_commands.flatten(0, 1)
+        next_critic_commands = self.next_critic_commands.flatten(0, 1)
         
         if self.saved_hidden_states_a is not None:
             hidden_states_a = [hidden_states.flatten(0, 1) for hidden_states in self.saved_hidden_states_a]
             hidden_states_c = [hidden_states.flatten(0, 1) for hidden_states in self.saved_hidden_states_c]
         if self.saved_hidden_states_p is not None:
             hidden_states_p = [hidden_states.flatten(0, 1) for hidden_states in self.saved_hidden_states_p]
-        
-        commands = self.commands.flatten(0, 1)
-        critic_commands = self.critic_commands.flatten(0, 1)
-        next_commands = self.next_commands.flatten(0, 1)
-        next_critic_commands = self.next_critic_commands.flatten(0, 1)
-        
+                
         not_dones = 1.0 - self.dones.float().flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
@@ -230,14 +231,14 @@ class RolloutStorage:
                         hidden_a_batch = tuple(hidden_a_batch)
                         hidden_c_batch = tuple(hidden_c_batch)
                     
-                hidden_e_batch = None
+                hidden_p_batch = None
                 if self.saved_hidden_states_p is not None:
-                    hidden_e_batch = [hidden_batch[batch_idx] for hidden_batch in hidden_states_p]
+                    hidden_p_batch = [hidden_batch[batch_idx] for hidden_batch in hidden_states_p]
                     
-                    if len(hidden_e_batch) == 1:
-                        hidden_e_batch = hidden_e_batch[0]
+                    if len(hidden_p_batch) == 1:
+                        hidden_p_batch = hidden_p_batch[0]
                     else:
-                        hidden_e_batch = tuple(hidden_e_batch)
+                        hidden_p_batch = tuple(hidden_p_batch)
                 
                 yield (
                     obs_batch,
@@ -258,6 +259,6 @@ class RolloutStorage:
                     old_sigma_batch,
                     hidden_a_batch,
                     hidden_c_batch,
-                    hidden_e_batch,
+                    hidden_p_batch,
                     (i == num_mini_batches - 1),
                 )

@@ -19,73 +19,133 @@ from .math import (
 )
 
 
-def load_imitation_dataset(folder, mapping="joint_id.txt", suffix=".npz"):
+def load_imitation_dataset(folder, mapping="joint_id.txt", suffix=".pkl"):
     filenames = [name for name in os.listdir(folder) if name[-len(suffix):] == suffix]
-    
-    datatset = {}
+
+    dataset = {}
     print("Loading motion dataset...")
     for filename in tqdm(filenames):
         try:
-            data = pickle.load(open(os.path.join(folder, filename), 'rb'))
-            datatset[filename[:-len(suffix)]] = data
+            file = open(os.path.join(folder, filename), 'rb')
+            data = pickle.load(file)
+            for key, value in data.items():
+                dataset[key] = value
         except:
             print(f"{filename} load failed!!!")
             continue
     
-    dataset_names = list(datatset.keys())
-    random.shuffle(dataset_names)
-    dataset_list = [datatset[name] for name in dataset_names]
-    
+    dataset_names = [k for k in dataset.keys()]
+    dataset_list = [v for v in dataset.values()]
+        
     lines = open(mapping).readlines()
     lines = [line[:-1].split(" ") for line in lines]
     joint_id_dict = {k: int(v) for v, k in lines}
     return dataset_list, dataset_names, joint_id_dict
 
 
-def filter_legal_motion(datasets, data_names, base_height_range, base_roll_range, base_pitch_range, min_time):
+def filter_and_fix_motion(
+    datasets, 
+    data_names,
+    min_time,
+    link_height_offset,
+    floor_height_offset,
+    base_height_range=None,
+    base_roll_range=None,
+    base_pitch_range=None,
+    ):
     legal_datasets, legal_names, total_length, total_time = [], [], 0, 0.0
     
+    print("Fixing heights...")
+    for data, name in zip(datasets, data_names):
+        data["base_position"][:, 2] += floor_height_offset
+        for link_name in data["link_position"].keys():
+            data["link_position"][link_name][:, 2] += floor_height_offset
+            data["link_position"][link_name][:, 2] += link_height_offset
+
+    print("Fixing NaN values...")
+    for data, name in zip(datasets, data_names):
+        num_frame = data["base_orientation"].shape[0]
+        
+        for n in data["link_orientation"].keys():
+            nan_ids = np.nonzero(np.isnan(data["link_orientation"][n]))
+            temp_ids, coor_ids = nan_ids
+
+            if len(temp_ids) > 0:
+                print(f"Nan values found in {name}: {temp_ids}")
+
+            for i in range(len(temp_ids)):
+                curr_ids = temp_ids[i].item()
+                orientation = data["link_orientation"][n][:, coor_ids[i]]
+                
+                if curr_ids == 0:
+                    prev_ids = post_ids = 1
+                elif curr_ids == num_frame - 1:
+                    prev_ids = post_ids = num_frame - 2
+                else:
+                    prev_ids, post_ids = curr_ids - 1, curr_ids + 1
+                    
+                fill_value = (orientation[prev_ids] + orientation[post_ids]) * 0.5
+                data["link_orientation"][n][temp_ids[i], coor_ids[i]] = fill_value
+
     print("Filtering motion dataset...")
     for data, name in zip(datasets, data_names):
         base_position = torch.tensor(data["base_position"], dtype=torch.float)
         base_orientation = torch.tensor(data["base_orientation"], dtype=torch.float)
         
-        min_height_ids = (base_position[:, 2] < min(base_height_range)).nonzero().flatten()
-        max_height_ids = (base_position[:, 2] > max(base_height_range)).nonzero().flatten()
+        last_ids = torch.tensor([base_position.shape[0]], dtype=torch.long)
         
-        motion_base_quat = euler_xyz_to_quat(base_orientation)
-        motion_base_rpy = quat_to_euler_xyz(quat_mul_yaw_inverse(motion_base_quat, motion_base_quat))
+        min_height_ids, max_height_ids = last_ids, last_ids
+        min_base_roll_ids, max_base_roll_ids = last_ids, last_ids
+        min_base_pitch_ids, max_base_pitch_ids = last_ids, last_ids
         
-        min_base_roll_ids = (motion_base_rpy[:, 0] < min(base_roll_range)).nonzero().flatten()
-        max_base_roll_ids = (motion_base_rpy[:, 0] > max(base_roll_range)).nonzero().flatten()
-        
-        min_base_pitch_ids = (motion_base_rpy[:, 1] < min(base_pitch_range)).nonzero().flatten()
-        max_base_pitch_ids = (motion_base_rpy[:, 1] > max(base_pitch_range)).nonzero().flatten()
-        
-        illegal_id_list = torch.cat([
-            min_height_ids, min_base_roll_ids, min_base_pitch_ids, 
-            max_height_ids, max_base_roll_ids, max_base_pitch_ids,], dim=0)
+        if base_height_range is not None:
+            min_height_ids = (base_position[:, 2] < min(base_height_range)).nonzero().flatten()
+            max_height_ids = (base_position[:, 2] > max(base_height_range)).nonzero().flatten()
+            
+        if base_roll_range is not None or base_pitch_range is not None:
+            motion_base_quat = euler_xyz_to_quat(base_orientation)
+            motion_base_rpy = quat_to_euler_xyz(quat_mul_yaw_inverse(motion_base_quat, motion_base_quat))
+            
+            if base_roll_range is not None:
+                min_base_roll_ids = (motion_base_rpy[:, 0] < min(base_roll_range)).nonzero().flatten()
+                max_base_roll_ids = (motion_base_rpy[:, 0] > max(base_roll_range)).nonzero().flatten()
+
+            if base_pitch_range is not None:
+                min_base_pitch_ids = (motion_base_rpy[:, 1] < min(base_pitch_range)).nonzero().flatten()
+                max_base_pitch_ids = (motion_base_rpy[:, 1] > max(base_pitch_range)).nonzero().flatten()
+
+        illegal_id_list = torch.cat([min_height_ids, min_base_roll_ids, min_base_pitch_ids, 
+                                     max_height_ids, max_base_roll_ids, max_base_pitch_ids,], dim=0)
         
         if len(illegal_id_list) > 0:
             first_illegal_ids = torch.amin(illegal_id_list).item()
             if first_illegal_ids > max(math.ceil(min_time * data["framerate"]), 3):
-                data["base_position"] = data["base_position"][:first_illegal_ids]
-                data["base_orientation"] = data["base_orientation"][:first_illegal_ids]
-                data["joint_position"] = data["joint_position"][:first_illegal_ids]
+                data["base_position"] = data["base_position"][1:first_illegal_ids]
+                data["base_orientation"] = data["base_orientation"][1:first_illegal_ids]
+                data["joint_position"] = data["joint_position"][1:first_illegal_ids]
                     
                 for n in data["link_position"].keys():
-                    data["link_position"][n] = data["link_position"][n][:first_illegal_ids]
-                    data["link_orientation"][n] = data["link_orientation"][n][:first_illegal_ids]
+                    data["link_position"][n] = data["link_position"][n][1:first_illegal_ids]
+                    data["link_orientation"][n] = data["link_orientation"][n][1:first_illegal_ids]
                 
                 legal_datasets += [data]
                 legal_names += [name]
-                total_length += first_illegal_ids
-                total_time += first_illegal_ids / data["framerate"]
+                total_length += first_illegal_ids - 1
+                total_time += (first_illegal_ids - 1) / data["framerate"]
         else:
-            legal_datasets += [data]
-            legal_names += [name]
-            total_length += data["base_position"].shape[0]
-            total_time += data["base_position"].shape[0] / data["framerate"]
+            if len(data["base_position"]) > max(math.ceil(min_time * data["framerate"]), 3):
+                data["base_position"] = data["base_position"][1:]
+                data["base_orientation"] = data["base_orientation"][1:]
+                data["joint_position"] = data["joint_position"][1:]
+                        
+                for n in data["link_position"].keys():
+                    data["link_position"][n] = data["link_position"][n][1:]
+                    data["link_orientation"][n] = data["link_orientation"][n][1:]
+                
+                legal_datasets += [data]
+                legal_names += [name]
+                total_length += data["base_position"].shape[0]
+                total_time += data["base_position"].shape[0] / data["framerate"]
     
     print("Number of legal motion dataset: ", len(legal_datasets))
     print("Total frame number: ", total_length)
@@ -161,46 +221,91 @@ class MotionLib:
         # flush original datasets
         del datasets
         
-        # priority Scheduler
+        # hyper parameters
+        self.default_distance = 1.5 # m
+        self.info_decay_rate = 0.9 # decay rate of imitation info
+        self.sampling_ratio = 0.5 # ratio between failure and distance
+        self.init_epsilon = 0.05 # initial exploration rate
+        self.uniform_init_epsilon = 0.5 # uniform exploration rate
+
+        # priority scheduler
         self.random_start_times = torch.clone((self.length - 2) * self.dt)
-        self.num_success = torch.zeros(self.num_motion, dtype=torch.float, device=self.device)
+        self.num_failure = torch.zeros(self.num_motion, dtype=torch.float, device=self.device)
+        self.motion_score = torch.zeros(self.num_motion, dtype=torch.float, device=self.device)
+        self.motion_score += self.default_distance
+        
+        self.temp_failure = torch.zeros(self.num_motion, dtype=torch.float, device=self.device)
+        self.temp_score = torch.zeros(self.num_motion, dtype=torch.float, device=self.device)
 
     def check_success(self, motion_ids, motion_times):
-        return torch.ceil(motion_times * self.fps) >= (self.length[motion_ids] - 1)
+        motion_step = torch.ceil(motion_times * self.fps)
+        return motion_step >= (self.length[motion_ids] - 1)
     
     def sample_motions(self, num_samples, uniform=False):
         if uniform:
             return torch.randint(self.num_motion, (num_samples,), device=self.device)
-        max_num_success = torch.amax(torch.clip(self.num_success, min=1.0), dim=0)
-        sampling_weight = 1.0 - self.num_success / max_num_success + 0.001
-        return torch.multinomial(sampling_weight, num_samples=num_samples, replacement=True).to(self.device)
+        
+        max_failure = torch.amax(torch.clip(self.num_failure, min=1e-4), dim=0)
+        failure_score = self.num_failure / max_failure * self.sampling_ratio
+        
+        max_distance = torch.amax(torch.clip(self.motion_score, min=1e-4), dim=0)
+        distance_score = self.motion_score / max_distance * (1.0 - self.sampling_ratio)
+        
+        sampling_weight = torch.clip(failure_score + distance_score, min=1e-4)
+        return torch.multinomial(sampling_weight.to(self.device), num_samples=num_samples, replacement=True)
     
     def sample_init_time(self, motion_ids, uniform=False):
-        epsilon = 0.05
         phase = torch.rand(motion_ids.shape, dtype=torch.float, device=self.device)
-        phase = torch.clip(phase * (1 + epsilon) - 0.5 * epsilon, min=0.0, max=1.0)
-        return phase * (self.get_motion_time(motion_ids) if uniform else self.random_start_times[motion_ids]) 
-
-    def update_imitation_info(self, motion_ids, success, init_time):
-        success_ids = success.nonzero().flatten()
-        if len(success_ids) == 0: return
+        phase = torch.clip(phase + (phase - 1) * self.init_epsilon, min=0.0, max=1.0)
         
-        success_motion_ids = motion_ids[success_ids]
-        success_init_time = init_time[success_ids]
-        motion_completed = (success_init_time < self.dt).float()
+        motion_total_time = self.get_motion_time(motion_ids)
+        if uniform:
+            return phase * motion_total_time
+        else:
+            return phase * torch.where(
+                torch.rand_like(phase) < self.uniform_init_epsilon,
+                motion_total_time,
+                self.random_start_times[motion_ids],
+            )
 
-        self.random_start_times.scatter_reduce_(
-            0, success_motion_ids, 
-            success_init_time, reduce="amin", include_self=True)
-        self.num_success.scatter_reduce_(
-            0, success_motion_ids,
-            motion_completed, reduce="sum", include_self=True)
+    def update_imitation_info(self, motion_ids, init_time, motion_time, success, max_distance):
+        success_ids = success.nonzero().flatten()
+        if len(success_ids) > 0:
+            self.random_start_times.scatter_reduce_(
+                dim=0, index=motion_ids[success_ids],
+                src=init_time[success_ids],
+                reduce="amin", include_self=True,)
+        
+        unique_motion_ids = torch.unique(motion_ids)
+        self.temp_failure.scatter_reduce_(
+            dim=0, index=motion_ids,
+            src=(~success).float(),
+            reduce="mean", include_self=False,
+            )
+        
+        motion_time = self.get_motion_time(motion_ids) - init_time
+        completion = (motion_time - init_time) / torch.clip(motion_time, min=1e-3)
+        motion_score = completion * max_distance + (1.0 - completion) * self.default_distance
+        self.temp_score.scatter_reduce_(
+            dim=0, index=motion_ids,
+            src=motion_score,
+            reduce="mean", include_self=False,
+            )
+        
+        self.num_failure[unique_motion_ids] *= self.info_decay_rate
+        new_failure = self.temp_failure[unique_motion_ids]
+        new_failure *= (1.0 - self.info_decay_rate)
+        self.num_failure[unique_motion_ids] += new_failure
+        
+        self.motion_score[unique_motion_ids] *= self.info_decay_rate
+        new_distance = self.temp_score[unique_motion_ids]
+        new_distance *= (1.0 - self.info_decay_rate)
+        self.motion_score[unique_motion_ids] += new_distance
 
     def get_imitation_info(self):
-        normalized_length = (self.length - 1) / (self.total_length - self.num_motion)
-        completion = torch.sum(self.get_completion() * normalized_length)
-        
-        success_rate = (self.num_success > 0).float()
+        length, completion = self.length - 1, self.get_completion()
+        completion = torch.sum(completion * length) / torch.sum(length)
+        success_rate = (self.random_start_times < self.dt).float()
         success_rate = torch.sum(success_rate / self.num_motion)
         return completion, success_rate
 
@@ -208,8 +313,8 @@ class MotionLib:
         return (self.length[motion_ids] - 1) * self.dt
     
     def get_completion(self, motion_ids=None):
-        random_start_frames = self.random_start_times * self.fps
-        completion = (self.length - 1 - random_start_frames) / (self.length - 1)
+        motion_time = (self.length - 1) * self.dt
+        completion = (motion_time - self.random_start_times) / motion_time
         return completion if motion_ids is None else completion[motion_ids]
         
     def get_motion_states(self, motion_ids, motion_times):
@@ -218,14 +323,14 @@ class MotionLib:
         frames = torch.clip(motion_times * self.fps, 
             min=torch.zeros_like(motion_times), max=self.length[motion_ids] - 2)
         floors = torch.floor(frames).long()
-        blend_motion_lerp = lambda x: self.calc_blend(
+        blend_motion_lerp = lambda x: self.calc_lerp(
             x, motion_start_ids + floors, frames - floors)
-        blend_motion_slerp = lambda x: self.calc_slerp(
+        blend_motion_elerp = lambda x: self.calc_elerp(
             x, motion_start_ids + floors, frames - floors)
-                
+        
         return dict(
             base_pos=blend_motion_lerp(self.base_pos), 
-            base_quat=blend_motion_slerp(self.base_rpy),
+            base_quat=blend_motion_elerp(self.base_rpy),
             base_lin_vel=blend_motion_lerp(self.base_lin_vel),
             base_ang_vel=blend_motion_lerp(self.base_ang_vel),
             
@@ -233,24 +338,32 @@ class MotionLib:
             dof_vel=blend_motion_lerp(self.dof_vel),
             
             body_pos=blend_motion_lerp(self.body_pos), 
-            body_quat=blend_motion_slerp(self.body_rpy),
+            body_quat=blend_motion_elerp(self.body_rpy),
             body_lin_vel=blend_motion_lerp(self.body_lin_vel), 
             body_ang_vel=blend_motion_lerp(self.body_ang_vel),
             )
     
-    @staticmethod    
-    def calc_blend(motion, frame, t):
+    @staticmethod
+    def calc_lerp(motion, frame, t):
         motion0, motion1 = motion[frame], motion[frame + 1]
-        shape = t.shape + (1,) * (motion0.dim() - t.dim())
-        return (1 - t).view(*shape) * motion0 + t.view(*shape) * motion1
+        shape = torch.Size(t.shape + (1,) * (motion0.dim() - t.dim()))
+        return (1 - t).view(shape) * motion0 + t.view(shape) * motion1
+    
+    @staticmethod
+    def calc_elerp(motion, frame, t):
+        motion0, motion1 = motion[frame], motion[frame + 1]
+        shape = torch.Size(t.shape + (1,) * (motion0.dim() - t.dim()))
+        diff_motion = motion1 - motion0
+        diff_motion = (diff_motion + math.pi) % (2 * math.pi) - math.pi
+        return euler_xyz_to_quat(motion0 + t.view(shape) * diff_motion)
 
-    @staticmethod    
+    @staticmethod
     def calc_slerp(motion, frame, t):
         motion0 = euler_xyz_to_quat(motion[frame])
         motion1 = euler_xyz_to_quat(motion[frame + 1])
         
-        shape = t.shape + (1,) * (motion0.dim() - t.dim())
-        w0, w1 = (1 - t).view(*shape), t.view(*shape)
+        shape = torch.Size(t.shape + (1,) * (motion0.dim() - t.dim()))
+        w0, w1 = (1 - t).view(shape), t.view(shape)
         
         cosine = F.cosine_similarity(motion0, motion1, dim=-1)
         cosine = cosine[..., None]
@@ -301,7 +414,7 @@ class MotionLoader:
             diff_quat = quat_mul(quat[1:], quat_conjugate(quat[:-1]))
             angle, axis = quat_to_angle_axis(diff_quat)
             return axis * angle[..., None] * origin_fps
-
+        
         def compute_joint_velocity(q):
             return (q[1:] - q[:-1]) * origin_fps
         
@@ -312,8 +425,8 @@ class MotionLoader:
             timesteps = torch.minimum(motion_times * origin_fps, origin_length[i] - 2)
             timesteps_floor = torch.floor(timesteps).long()
             
-            blend_motion_lerp = lambda x: self.calc_blend(x, timesteps_floor, timesteps - timesteps_floor)
-            blend_motion_slerp = lambda x: self.calc_slerp(x, timesteps_floor, timesteps - timesteps_floor)
+            blend_motion_lerp = lambda x: self.calc_lerp(x, timesteps_floor, timesteps - timesteps_floor)
+            blend_motion_elerp = lambda x: self.calc_elerp(x, timesteps_floor, timesteps - timesteps_floor)
             
             base_pos = torch.tensor(data["base_position"], dtype=torch.float)
             base_rpy = torch.tensor(data["base_orientation"], dtype=torch.float)
@@ -321,7 +434,7 @@ class MotionLoader:
             base_ang_vel = compute_angular_velocity(base_rpy)
             
             self.base_pos[start:end] = blend_motion_lerp(base_pos)[:self.length[i]]
-            self.base_quat[start:end] = blend_motion_slerp(base_rpy)[:self.length[i]]
+            self.base_quat[start:end] = blend_motion_elerp(base_rpy)[:self.length[i]]
             self.base_lin_vel[start:end] = blend_motion_lerp(base_lin_vel)[:self.length[i]]
             self.base_ang_vel[start:end] = blend_motion_lerp(base_ang_vel)[:self.length[i]]
             
@@ -339,29 +452,37 @@ class MotionLoader:
                 body_ang_vel = compute_angular_velocity(body_rpy)
                 
                 self.body_pos[start:end, k] = blend_motion_lerp(body_pos)[:self.length[i]]
-                self.body_quat[start:end, k] = blend_motion_slerp(body_rpy)[:self.length[i]]
+                self.body_quat[start:end, k] = blend_motion_elerp(body_rpy)[:self.length[i]]
                 self.body_lin_vel[start:end, k] = blend_motion_lerp(body_lin_vel)[:self.length[i]]
                 self.body_ang_vel[start:end, k] = blend_motion_lerp(body_ang_vel)[:self.length[i]]
-
+        
         # flush
         del datasets
         
     def load_states_function(self, function):
         self.function = function
 
-    @staticmethod    
-    def calc_blend(motion, frame, t):
+    @staticmethod
+    def calc_lerp(motion, frame, t):
         motion0, motion1 = motion[frame], motion[frame + 1]
-        shape = t.shape + (1,) * (motion0.dim() - t.dim())
-        return (1 - t).view(*shape) * motion0 + t.view(*shape) * motion1
+        shape = torch.Size(t.shape + (1,) * (motion0.dim() - t.dim()))
+        return (1 - t).view(shape) * motion0 + t.view(shape) * motion1
 
-    @staticmethod    
+    @staticmethod
+    def calc_elerp(motion, frame, t):
+        motion0, motion1 = motion[frame], motion[frame + 1]
+        shape = torch.Size(t.shape + (1,) * (motion0.dim() - t.dim()))
+        diff_motion = motion1 - motion0
+        diff_motion = (diff_motion + math.pi) % (2 * math.pi) - math.pi
+        return euler_xyz_to_quat(motion0 + t.view(shape) * diff_motion)
+
+    @staticmethod
     def calc_slerp(motion, frame, t):
         motion0 = euler_xyz_to_quat(motion[frame])
         motion1 = euler_xyz_to_quat(motion[frame + 1])
         
-        shape = t.shape + (1,) * (motion0.dim() - t.dim())
-        w0, w1 = (1 - t).view(*shape), t.view(*shape)
+        shape = torch.Size(t.shape + (1,) * (motion0.dim() - t.dim()))
+        w0, w1 = (1 - t).view(shape), t.view(shape)
         
         cosine = F.cosine_similarity(motion0, motion1, dim=-1)
         cosine = cosine[..., None]

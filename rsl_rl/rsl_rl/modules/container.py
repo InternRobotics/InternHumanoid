@@ -6,125 +6,89 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from typing import Union
-
-from .estimator import EstimatorRecurrent
-from .network import LSTMCell, GRUCell, MinRNNCell
+from .network import LSTMCell, GRUCell
 from .actor_critic import ActorCritic
-from .actor_critic_latent import ActorCriticLatent
 from .actor_critic_recurrent import ActorCriticRecurrent
 
 
 class Container(nn.Module):
-    estimator: Union[EstimatorRecurrent, None]
-    actor_critic: Union[ActorCritic, ActorCriticRecurrent]
+    is_recurrent = False
     
-    def __init__(self, actor_critic, estimator=None):
+    def __init__(self, actor_critic: ActorCritic, num_envs):
         super().__init__()
-        self.estimator = estimator
-        self.actor_critic = actor_critic
+        self.noise_mode = actor_critic.noise_mode
+        self.actor = nn.Sequential(
+            actor_critic.actor,
+            actor_critic.actor_head,
+            )
+        self.normalizer1 = actor_critic.normalizers["actor"]
+        self.normalizer2 = actor_critic.normalizers["command"]
         
-    def reset_hidden_states(self, inputs):
-        hidden_e, hidden_a = (), ()
-        if self.estimator is not None:
-            rnn_module = self.estimator.memory_e
-            hidden_e = get_rnn_initial_states(rnn_module, inputs)
-        if self.actor_critic.is_recurrent:
-            rnn_module = self.actor_critic.memory_a
-            hidden_a = get_rnn_initial_states(rnn_module, inputs)
-        return hidden_e, hidden_a
-
-    def forward(
-        self,
-        observations,
-        commands,
-        hidden_e=None, 
-        hidden_a=None,
-        ):
-        actor_obs = observations
-        if self.estimator is not None:
-            estimations, hidden_e = self.estimator.predict_inference(observations, hidden_states=hidden_e)
-            actor_obs = torch.cat([estimations, observations], dim=-1)
-        action_mean, hidden_a = self.actor_critic.act_inference(actor_obs, commands, hidden_states=hidden_a)
-        return action_mean, hidden_e, hidden_a
-    
-
-class LatentContainer(nn.Module):
-    estimator: Union[EstimatorRecurrent, None]
-    actor_critic: ActorCriticLatent
-    
-    def __init__(self, actor_critic, estimator=None):
-        super().__init__()
-        self.latents = None
-        self.estimator = estimator
-        self.actor_critic = actor_critic
-            
-    def reset_hidden_states(self, inputs):
-        hidden_e, hidden_a = (), ()
-        if self.estimator is not None:
-            rnn_module = self.estimator.memory_e
-            hidden_e = get_rnn_initial_states(rnn_module, inputs)
-        if self.actor_critic.is_recurrent:
-            rnn_module = self.actor_critic.memory_a
-            hidden_a = get_rnn_initial_states(rnn_module, inputs)
-        return hidden_e, hidden_a
-            
-    def forward(
-        self,
-        observations,
-        commands,
-        update_sign,
-        hidden_e=None, 
-        hidden_a=None,
-        generation=False,
-        ):
-        if generation and self.latents is not None:
-            prior_latents = self.actor_critic.predict_prior_inference(observations, noise_scale=0.01)
-            self.latents = torch.where(update_sign.view(-1, 1), prior_latents, self.latents)
+    def forward(self, observations, commands):
+        concate_observations = torch.cat([
+            self.normalizer1(observations),
+            self.normalizer2(commands),], dim=-1)
+        
+        action_mean = self.actor(concate_observations)
+        if self.noise_mode == "policy":
+            return torch.chunk(action_mean, 2, dim=-1)[0]
         else:
-            self.latents = self.actor_critic.encode_inference(commands)
-            
-        actor_obs = observations
-        if self.estimator is not None:
-            estimations, hidden_e = self.estimator.predict_inference(observations, hidden_states=hidden_e)
-            actor_obs = torch.cat([estimations, observations], dim=-1)        
-        action_mean, hidden_a = self.actor_critic.act_inference(actor_obs, self.latents, hidden_states=hidden_a)
-        return action_mean, hidden_e, hidden_a
+            return action_mean
+    
 
-class HIMContainer(torch.nn.Module):
-    def __init__(self, actor_critic):
+class RecurrentContainer(nn.Module):
+    is_recurrent = True
+    
+    def __init__(self, actor_critic: ActorCriticRecurrent, num_envs):
         super().__init__()
-        self.actor = actor_critic.actor
-        self.estimator = actor_critic.estimator.encoder
-
-    def forward(self, obs_history):
-        parts = self.estimator(obs_history)
-        vel, z = parts[..., :3], parts[..., 3:]
-        z = F.normalize(z, dim=-1, p=2.0)
-        return self.actor(torch.cat((obs_history[:, -82:], vel, z), dim=1))
+        self.noise_mode = actor_critic.noise_mode
+        self.actor = nn.Sequential(
+            actor_critic.actor,
+            actor_critic.actor_head,
+            )
+        self.memory = actor_critic.memory_a
+        self.is_lstm = isinstance(self.memory, LSTMCell)
+        
+        self.normalizer0 = actor_critic.normalizers["memory"]
+        self.normalizer1 = actor_critic.normalizers["actor"]
+        self.normalizer2 = actor_critic.normalizers["command"]
+        
+        hidden_dim = self.memory.hidden_dim
+        self.register_buffer("hidd", torch.zeros(num_envs, hidden_dim, dtype=torch.float))
+        self.register_buffer("cell", torch.zeros(num_envs, hidden_dim, dtype=torch.float))
     
-
-def get_rnn_initial_states(rnn_module, input):
-    if isinstance(rnn_module, LSTMCell):
-        h_zeros = torch.zeros(
-            input.shape[0],
-            rnn_module.hidden_dim,
-            dtype=input.dtype,
-            device=input.device,)
-        c_zeros = torch.zeros(
-            input.shape[0],
-            rnn_module.hidden_dim,
-            dtype=input.dtype,
-            device=input.device,)
-        return h_zeros, c_zeros
-    elif isinstance(rnn_module, (GRUCell, MinRNNCell)):
-        h_zeros = torch.zeros(
-            input.shape[0],
-            rnn_module.hidden_dim,
-            dtype=input.dtype,
-            device=input.device,)
-        return h_zeros
-    else:
-        raise NotImplementedError
-    
+    @torch.jit.export
+    def reset(self, num_batch, masks):
+        self.hidd[:num_batch][masks] = 0.0
+        self.cell[:num_batch][masks] = 0.0
+        
+    def forward(self, observations, commands, resets):
+        num_batch = observations.shape[0]
+        self.reset(num_batch, resets)
+        
+        if self.is_lstm:
+            hidden_states = (
+                self.hidd[:num_batch], 
+                self.cell[:num_batch],
+                )
+        else:
+            hidden_states = self.hidd[:num_batch]
+        
+        memories, next_hidden_states = self.memory(
+            self.normalizer0(observations), hidden_states)
+        
+        if self.is_lstm:
+            self.hidd[:num_batch] = next_hidden_states[0]
+            self.cell[:num_batch] = next_hidden_states[1]
+        else:
+            self.hidd[:num_batch] = next_hidden_states
+        
+        concate_observations = torch.cat([
+            self.normalizer1(memories),
+            self.normalizer2(commands),], dim=-1)
+        
+        action_mean = self.actor(concate_observations)
+        if self.noise_mode == "policy":
+            return torch.chunk(action_mean, 2, dim=-1)[0]
+        else:
+            return action_mean

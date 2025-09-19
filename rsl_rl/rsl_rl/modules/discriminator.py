@@ -43,11 +43,10 @@ class Discriminator(nn.Module):
         activation = get_activation(activation)
         self.task_reward_lerp = task_reward_lerp
         self.style_reward_scale = style_reward_scale
-        
-        self.disc_normalizer = Normalization(shape=[num_states])
-        self.reward_normalizer = None
         if self.gan_type == "wasserstein":
             self.reward_normalizer = Normalization(shape=[1])
+        else:
+            self.reward_normalizer = nn.Identity()
         
         # Discriminator
         disc_layers = [nn.Linear(num_states * 2, disc_hidden_dims[0]), activation]
@@ -63,8 +62,6 @@ class Discriminator(nn.Module):
         return logits
 
     def compute_policy_loss(self, states, next_states):
-        states = self.disc_normalizer(states)
-        next_states = self.disc_normalizer(next_states)
         logits = self.forward(states, next_states)
         if self.gan_type == "lsgan":
             return self.loss_function(logits, -1.0 * torch.ones_like(logits))
@@ -76,8 +73,6 @@ class Discriminator(nn.Module):
             raise ValueError(f"Invalid discriminator type: {self.gan_type}")
 
     def compute_expert_loss(self, states, next_states):
-        states = self.disc_normalizer(states)
-        next_states = self.disc_normalizer(next_states)
         logits = self.forward(states, next_states)
         if self.gan_type == "lsgan":
             return self.loss_function(logits, torch.ones_like(logits))
@@ -104,30 +99,25 @@ class Discriminator(nn.Module):
     @torch.no_grad()
     def compute_prediction(self, states, next_states):
         self.eval()
-        states = self.disc_normalizer(states)
-        next_states = self.disc_normalizer(next_states)
         logits = self.forward(states, next_states)
+        logits = self.reward_normalizer(logits)
         if self.gan_type == "lsgan":
             return logits
         if self.gan_type == "bcegan":
             return F.sigmoid(logits)
-        elif self.gan_type == "wasserstein":
-            return self.reward_normalizer(logits)
         else:
             raise ValueError(f"Invalid discriminator type: {self.gan_type}")
 
     @torch.no_grad()
     def compute_mixed_reward(self, states, next_states, task_reward):
         self.eval()
-        states = self.disc_normalizer(states)
-        next_states = self.disc_normalizer(next_states)
         logits = self.forward(states, next_states)
+        logits = self.reward_normalizer(logits)
         if self.gan_type == "lsgan":
             style_reward = torch.clip(1.0 - 0.25 * torch.square(logits - 1.0), min=0.0)
         elif self.gan_type == "bcegan":
             style_reward = -1.0 * torch.log(torch.clip(1.0 - F.sigmoid(logits), min=1e-4))
         elif self.gan_type == "wasserstein":
-            style_reward = self.reward_normalizer(logits)
             self.reward_normalizer.update(logits)
         else:
             raise ValueError(f"Invalid discriminator type: {self.gan_type}")

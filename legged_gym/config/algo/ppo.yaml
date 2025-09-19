@@ -3,14 +3,15 @@ algo:
     seed: 1
     runner_class_name: "OnPolicyRunner"
     policy:
-        actor_hidden_dims: [1024, 512, 256, 256]
-        critic_hidden_dims: [512, 512, 256, 256]
+        actor_hidden_dims: [1024, 1024, 512, 512, 256]
+        critic_hidden_dims: [1024, 512, 512, 256, 256]
 
-        rnn_type: "lstm"
+        rnn_type: "gru"
         rnn_hidden_dim: 256
           
         init_std: 1.0
-        const_noise: False
+        noise_mode: "learnable"
+
     algorithm:
       # training params
       value_loss_coef: 5.0
@@ -18,15 +19,15 @@ algo:
       value_clip_param: 0.5
       use_clipped_value_loss: True
       entropy_coef: 0.01
-      num_learning_epochs: 5
+      num_learning_epochs: 4
       # mini batch size: num_envs*nsteps / nminibatches
-      num_mini_batches: 5
+      num_mini_batches: 10
       learning_rate: 1e-4
       learning_rate_limit: [1e-5, 1e-4]
       schedule: "adaptive" # could be adaptive, fixed
       gamma: 0.99
       lam: 0.95
-      desired_kl: 0.01
+      desired_kl: 0.02
       max_grad_norm: 1.0
 
       disc_num_batch_size: 512
@@ -41,8 +42,8 @@ algo:
     runner:
       policy_class_name: "ActorCritic"
       algorithm_class_name: "PPO"
-      num_warmup_steps: 500
-      num_steps_per_env: 55 # per iteration
+      num_warmup_steps: 100
+      num_steps_per_env: 25 # per iteration
       max_iterations: 100000 # number of policy updates
       
       # logging

@@ -7,15 +7,15 @@ task:
   name: g1_im
   seed: 0
   env:
-    num_envs: 5120
+    num_envs: 8192
     env_spacing: 5.0  # not used with heightfields/trimeshes
     max_episode_length_sec: 20 # max episode length in seconds
     
-    future_dt: 0.1  # sec
-    future_timesteps: 5
+    future_dt: 0.05  # sec
+    future_timesteps: 10
 
   init_state:
-    pos: [0.0, 0.0, 0.1] # x,y,z [m]
+    pos: [0.0, 0.0, 0.15] # x,y,z [m]
     rot: [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
     lin_vel: [0.0, 0.0, 0.0]  # x,y,z [m/s]
     ang_vel: [0.0, 0.0, 0.0]  # x,y,z [rad/s]
@@ -41,13 +41,18 @@ task:
     joint_mapping: "joint_id.txt"    
     # resample motion (for universal tracking)
     resample_motion: True
-        
+
+    randomize_motion_speed: True
+    motion_speed_range: [0.75, 1.25]
+
     motion_filter:
       min_time: 2.0 # sec
-      base_height_range: [0.3, 1.5] # m
-      base_roll_range: [-1.0, 1.0] # rad
-      base_pitch_range: [-0.8, 1.5] # rad
-    
+      link_height_offset: -0.075 # m
+      floor_height_offset: 0.05 # m
+      base_height_range: [0.2, 1.5] # m
+      base_roll_range: None # rad
+      base_pitch_range: None # rad
+
   # dataset for skill imitation
   skill_demonstration:
     prefix: "./resources/dataset/g1_29dof_data"
@@ -58,7 +63,7 @@ task:
     clip_observations: 100
     
     obs_scales:
-      tan_norm: 1.0
+      rotation: 1.0
       base_pos: 1.0
       body_pos: 1.0
       base_lin_vel: 2.0
@@ -70,13 +75,13 @@ task:
     
     add_noise: True
     noise_scales:
-      tan_norm: 0.05
+      rotation: 0.05
       base_pos: 0.05
       body_pos: 0.02
       base_lin_vel: 0.1
       base_ang_vel: 0.2
       dof_pos: 0.01
-      dof_vel: 2.0
+      dof_vel: 0.5
       gravity: 0.05
       height_points: 0.1
 
@@ -90,40 +95,40 @@ task:
     randomize_link_com: True
     link_com_range: [-0.1, 0.1]
 
-    randomize_friction: True
-    friction_range: [0.1, 1.5]
-
     randomize_restitution: True
-    restitution_range: [0.0, 1.0]
+    restitution_range: [0.0, 0.1]
+
+    randomize_friction: True
+    friction_range: [0.5, 1.5]
 
     randomize_joint_friction: True
-    joint_friction_range: [0.1, 1.2]
+    joint_friction_range: [0.2, 1.5]
 
     randomize_joint_damping: True
-    joint_damping_range: [0.2, 1.2]
+    joint_damping_range: [0.3, 1.5]
 
     randomize_joint_armature: True
-    joint_armature_range: [0.01, 0.05]
+    joint_armature_range: [0.001, 0.025]
 
     randomize_pd_gain: True
     kp_range: [0.8, 1.2]
     kd_range: [0.8, 1.2]
 
     randomize_joint_injection: True
-    joint_injection_range: [-0.05, 0.05]
+    joint_injection_range: [-0.01, 0.01]
 
     randomize_actuation_offset: True
-    actuation_offset_range: [-0.05, 0.05]
+    actuation_offset_range: [-0.01, 0.01]
 
     randomize_initial_joint_position: True
-    initial_joint_offset_range: [-0.1, 0.1]
+    initial_joint_offset_range: [-0.01, 0.01]
 
     push_robot_base: True
-    push_robot_base_interval_sec: [5.0, 10.0] # sec
+    push_robot_base_interval_sec: [5.0, 8.0] # sec
     push_robot_base_max_lin_vel: 0.25 # m/s
 
     push_robot_body: True
-    push_robot_body_interval_sec: [2.0, 4.0] # sec
+    push_robot_body_interval_sec: [5.0, 8.0] # sec
     push_robot_body_duration_sec: [0.5, 1.0] # sec
     push_robot_body_max_force: 20 # N
     push_robot_body_max_torque: 20 # N * m
@@ -131,49 +136,48 @@ task:
 
   rewards:
     scales:
-      tracking_mobile_pos: 1.0
-      tracking_feet_pos: 2.0
-      tracking_marker_pos: 5.0
+      tracking_trunk_lin_vel : 4.0
+      tracking_trunk_ang_vel : 4.0
+      tracking_trunk_vel_dir : 4.0
       
-      tracking_joint_pos: 8.0
-      tracking_trunk_orin: 1.0
-      tracking_base_ang_vel: 1.0
+      tracking_joint_pos : 8.0
+      tracking_marker_pos : 4.0
+      tracking_feet_height : 4.0
+      tracking_keyframe_height : 2.0
       
-      tracking_base_lin_dir: 6.0
-      tracking_base_lin_vel: 6.0
+      penalty_torques : -1.0
+      penalty_action_rates : -7.0
+      penalty_action_smoothness : -2.0
       
-      feet_stumble: -10.0
-      feet_slippage: -0.5
-      feet_air_time: 50.0
+      feet_stumble : -10.0
+      feet_slippage : -1.5
+      feet_distance : -10.0
+      feet_air_time : -10.0
       
-      collisions: -5.0
-      joint_errors: -0.1
-      joint_accelerations: -5e-7
+      alive : 7.0
+      deviation : -10.0
+      termination : -10.0
       
-      rapid_torques: -1e-4
-      sluggish_torques: -1e-5
-      
-      rapid_action_rates: -0.1
-      sluggish_action_rates: -0.05
-
-      dof_pos_limits: -1.0
-      dof_vel_limits: -1.0
-      torque_limits: -0.1
-      action_limits: -1.0
-
-    only_positive_rewards: False
-    soft_dof_pos_limit: 0.9
-    soft_dof_vel_limit: 1.0
-    soft_torque_limit: 0.95
-    feet_air_time_limit: 0.25 # sec
+      dof_pos_limits : -10.0
+      dof_vel_limits : -10.0
+      torque_limits : -5.0
+      action_limits : -5.0
+        
+    only_positive_rewards : False
+    soft_dof_pos_limit : 0.9
+    soft_dof_vel_limit : 0.9
+    soft_torques_limit : 0.9
     
-    init_sigma: 10.0
-    sigma_momentum: 0.002 
-
+    feet_height_target : 0.05 # m
+    feet_xy_dist_target : 0.1 # m
+    feet_air_time_target : 0.25 # sec
+    
+    momentum : 0.005
+    init_sigma : 100.0
+    init_coefficient : 100.0
+    
   termination:
-    termination_height: 0.2 # m
-    termination_orin: 1.0 # rad
-    termination_time: 2.0 # sec
+    termination_height: 0.5 # m
     deviation_distance: 0.25 # m
           
   # viewer camera:

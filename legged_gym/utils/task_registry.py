@@ -86,53 +86,7 @@ class TaskRegistry():
         env = task_class(cfg=env_cfg, sim_params=sim_params, physics_engine=args.physics_engine, sim_device=args.sim_device, headless=args.headless,)
         return env, env_cfg
 
-    def make_runner(self, env, runner_class, name=None, args=None, train_cfg=None, log_root="default") -> Tuple[OnPolicyRunner, dict]:
-        """ Creates the training algorithm  either from a registered namme or from the provided config file.
-
-        Args:
-            env (isaacgym.VecTaskPython): The environment to train (TODO: remove from within the algorithm)
-            name (string, optional): Name of a registered env. If None, the config file will be used instead. Defaults to None.
-            args (Args, optional): Isaac Gym comand line arguments. If None get_args() will be called. Defaults to None.
-            train_cfg (Dict, optional): Training config file. If None 'name' will be used to get the config file. Defaults to None.
-            log_root (str, optional): Logging directory for Tensorboard. Set to 'None' to avoid logging (at test time for example). 
-                                      Logs will be saved in <log_root>/<date_time>_<run_name>. Defaults to "default"=<path_to_LEGGED_GYM>/logs/<experiment_name>.
-
-        Raises:
-            ValueError: Error if neither 'name' or 'train_cfg' are provided
-            Warning: If both 'name' or 'train_cfg' are provided 'name' is ignored
-
-        Returns:
-            PPO: The created algorithm
-            Dict: the corresponding config file
-        """
-
-        # if config files are passed use them, otherwise load from the name
-        if train_cfg is None:
-            raise ValueError('Train Cfg is None')
-
-        # override cfg from args (if specified)
-        _, train_cfg = update_cfg_from_args(None, train_cfg, args)
-
-        if log_root == "default":
-            log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
-            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
-        elif log_root is None:
-            log_dir = None
-        else:
-            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
-                
-        runner = runner_class(env, train_cfg, log_dir, device=args.rl_device)
-        # save resume path before creating a new log_dir
-        resume = train_cfg.runner.resume
-        if resume:
-            # load previously trained model
-            resume_path = get_load_path(
-                log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
-            print(f"Loading model from: {resume_path}")
-            runner.load(resume_path)
-        return runner, train_cfg
-
-    def make_latent_runner(self, env, runner_class, model, name=None, args=None, train_cfg=None, log_root="default") -> Tuple[OnPolicyRunner, dict]:
+    def make_runner(self, env, runner_class, name=None, args=None, train_cfg=None, log_root="default") -> Tuple[OnPolicyRunner, LeggedRobotCfgPPO]:
         """ Creates the training algorithm  either from a registered namme or from the provided config file.
 
         Args:
@@ -175,15 +129,18 @@ class TaskRegistry():
             log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
         
         train_cfg_dict = class_to_dict(train_cfg)
-        runner = runner_class(model, env, train_cfg_dict, log_dir, device=args.rl_device)
+        runner = runner_class(env, train_cfg_dict, log_dir, device=args.rl_device)
         # save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if resume:
-            # load previously trained model
-            resume_path = get_load_path(
-                log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
-            print(f"Loading model from: {resume_path}")
-            runner.load(resume_path)
+            try:
+                # load previously trained model
+                resume_path = get_load_path(log_root, 
+                    load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
+                print(f"Loading model from: {resume_path}")
+                runner.load(resume_path)
+            except:
+                print(f"Loading model failed!!!")
         return runner, train_cfg
 
 # make global task registry
