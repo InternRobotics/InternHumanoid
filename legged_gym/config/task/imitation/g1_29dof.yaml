@@ -136,45 +136,45 @@ task:
 
   rewards:
     scales:
-      tracking_trunk_lin_vel : 4.0
-      tracking_trunk_ang_vel : 4.0
-      tracking_trunk_vel_dir : 4.0
+      tracking_trunk_lin_vel: 4.0
+      tracking_trunk_ang_vel: 4.0
+      tracking_trunk_vel_dir: 4.0
       
-      tracking_joint_pos : 8.0
-      tracking_marker_pos : 4.0
-      tracking_feet_height : 4.0
-      tracking_keyframe_height : 2.0
+      tracking_joint_pos: 8.0
+      tracking_marker_pos: 4.0
+      tracking_feet_height: 4.0
+      tracking_keyframe_height: 2.0
       
-      penalty_torques : -1.0
-      penalty_action_rates : -7.0
-      penalty_action_smoothness : -2.0
+      penalty_torques: -1.0
+      penalty_action_rates: -7.0
+      penalty_action_smoothness: -2.0
       
-      feet_stumble : -10.0
-      feet_slippage : -1.5
-      feet_distance : -10.0
-      feet_air_time : -10.0
+      feet_stumble: -10.0
+      feet_slippage: -1.5
+      feet_distance: -10.0
+      feet_air_time: -10.0
       
-      alive : 7.0
-      deviation : -10.0
-      termination : -10.0
+      alive: 7.0
+      deviation: -10.0
+      termination: -10.0
       
-      dof_pos_limits : -10.0
-      dof_vel_limits : -10.0
-      torque_limits : -5.0
-      action_limits : -5.0
+      dof_pos_limits: -10.0
+      dof_vel_limits: -10.0
+      torque_limits: -5.0
+      action_limits: -5.0
         
-    only_positive_rewards : False
-    soft_dof_pos_limit : 0.9
-    soft_dof_vel_limit : 0.9
-    soft_torques_limit : 0.9
+    only_positive_rewards: False
+    soft_dof_pos_limit: 0.9
+    soft_dof_vel_limit: 0.9
+    soft_torques_limit: 0.9
     
-    feet_height_target : 0.05 # m
-    feet_xy_dist_target : 0.1 # m
-    feet_air_time_target : 0.25 # sec
+    feet_height_target: 0.05 # m
+    feet_xy_dist_target: 0.1 # m
+    feet_air_time_target: 0.25 # sec
     
-    momentum : 0.005
-    init_sigma : 100.0
-    init_coefficient : 100.0
+    momentum: 0.005
+    init_sigma: 100.0
+    init_coefficient: 100.0
     
   termination:
     termination_height: 0.5 # m
