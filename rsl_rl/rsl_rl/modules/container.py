@@ -92,3 +92,15 @@ class RecurrentContainer(nn.Module):
             return torch.chunk(action_mean, 2, dim=-1)[0]
         else:
             return action_mean
+
+class HIMContainer(torch.nn.Module):
+    def __init__(self, actor_critic):
+        super().__init__()
+        self.actor = actor_critic.actor
+        self.estimator = actor_critic.estimator.encoder
+
+    def forward(self, obs_history):
+        parts = self.estimator(obs_history)
+        vel, z = parts[..., :3], parts[..., 3:]
+        z = F.normalize(z, dim=-1, p=2.0)
+        return self.actor(torch.cat((obs_history[:, -82:], vel, z), dim=1))

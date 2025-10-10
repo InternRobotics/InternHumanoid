@@ -86,7 +86,7 @@ class TaskRegistry():
         env = task_class(cfg=env_cfg, sim_params=sim_params, physics_engine=args.physics_engine, sim_device=args.sim_device, headless=args.headless,)
         return env, env_cfg
 
-    def make_runner(self, env, runner_class, name=None, args=None, train_cfg=None, log_root="default") -> Tuple[OnPolicyRunner, LeggedRobotCfgPPO]:
+    def make_runner(self, env, runner_class, name=None, args=None, train_cfg=None, log_root="default"):
         """ Creates the training algorithm  either from a registered namme or from the provided config file.
 
         Args:

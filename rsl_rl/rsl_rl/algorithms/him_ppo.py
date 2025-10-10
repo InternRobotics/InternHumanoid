@@ -60,6 +60,7 @@ class HIMPPO:
         desired_kl=0.01,
         device="cpu",
         symmetry_scale=1e-3,
+        **kwargs,
     ):
 
         self.device = device

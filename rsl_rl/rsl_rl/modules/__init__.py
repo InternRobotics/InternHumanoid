@@ -12,7 +12,7 @@ from .network import HyperPolicyHead, HyperValueHead
 from .estimator import EstimatorRecurrent
 from .discriminator import Discriminator
 from .normalization import Normalization
-from .container import Container, RecurrentContainer
+from .container import Container, RecurrentContainer, HIMContainer
 
 from .him_actor_critic import HIMActorCritic
 from .him_estimator import HIMEstimator
